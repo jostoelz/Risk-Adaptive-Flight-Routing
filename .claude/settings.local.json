@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context\")",
+      "Bash(touch \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context/hardware_constraints.txt\" \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context/math_formulas.txt\")"
+    ]
+  }
+}
