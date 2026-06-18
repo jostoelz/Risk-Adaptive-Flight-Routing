@@ -155,8 +155,12 @@ def init_herd(n: int, bbox, rng) -> np.ndarray:
 
 
 def advance_herd(pos: np.ndarray, heading: np.ndarray, bbox, lat0, dt_s, rng,
-                 graze_speed=0.6, cohesion=0.15) -> Tuple[np.ndarray, np.ndarray]:
-    """Correlated random walk with light herd cohesion (boids-lite grazing)."""
+                 graze_speed=0.3, cohesion=0.15) -> Tuple[np.ndarray, np.ndarray]:
+    """Correlated random walk with light herd cohesion (boids-lite grazing).
+
+    graze_speed ~0.3 m/s is a realistic sheep grazing pace; the drone cruises at
+    DRONE_CRUISE_SPEED_MS (~11 m/s), giving a realistic ~35x UAV:herd speed ratio.
+    """
     lon_min, lat_min, lon_max, lat_max = bbox
     mlon = _m_per_deg_lon(lat0)
     n = pos.shape[0]
@@ -190,25 +194,49 @@ def advance_herd(pos: np.ndarray, heading: np.ndarray, bbox, lat0, dt_s, rng,
     return pos, heading
 
 
-def advance_drone(drone: Tuple[float, float], waypoints, lat0, dt_s
-                  ) -> Tuple[float, float]:
-    """Move the drone toward its first planned waypoint at that cell's speed."""
+# Realistic UAV operational cruise speed used to advance the drone each tick.
+DRONE_CRUISE_SPEED_MS = 11.0
+
+
+def advance_drone(drone: Tuple[float, float], waypoints, lat0, dt_s,
+                  cruise_ms: float = DRONE_CRUISE_SPEED_MS) -> Tuple[float, float]:
+    """Fly the drone a realistic arc-length along the SPLINE toward the herd.
+
+    The drone walks `cruise_ms * dt_s` metres along the smoothed (drone → next
+    waypoints) cubic-spline trajectory, so it travels continuously instead of
+    snapping to a single grid cell. Because the planner now places waypoints on
+    the herd hotspot (never the drone's own cell), this closes the distance to
+    the herd every tick and produces a smooth tracking flight.
+    """
     if not waypoints:
         return drone
-    lon, lat = drone
-    target = waypoints[0]
-    mlon = _m_per_deg_lon(lat0)
-    dx_m = (target["lon"] - lon) * mlon
-    dy_m = (target["lat"] - lat) * _M_PER_DEG_LAT
-    dist = math.hypot(dx_m, dy_m)
-    if dist < 1e-6:
+
+    raw = [[drone[0], drone[1]]] + [[w["lon"], w["lat"]] for w in waypoints]
+    path = smooth_path_lonlat(raw, samples_per_segment=16)  # (M, 2) lon/lat
+    if len(path) < 2:
         return drone
-    speed = max(float(target.get("speed_ms", 5.0)), 0.5)
-    step = min(speed * dt_s, dist)
-    ux, uy = dx_m / dist, dy_m / dist
-    new_lon = lon + (step * ux) / mlon
-    new_lat = lat + (step * uy) / _M_PER_DEG_LAT
-    return (new_lon, new_lat)
+
+    mlon = _m_per_deg_lon(lat0)
+    budget_m = max(float(cruise_ms), 0.0) * float(dt_s)
+    if budget_m <= 0:
+        return drone
+
+    cur = np.asarray(path[0], dtype=float)
+    for nxt in path[1:]:
+        nxt = np.asarray(nxt, dtype=float)
+        seg_m = math.hypot((nxt[0] - cur[0]) * mlon, (nxt[1] - cur[1]) * _M_PER_DEG_LAT)
+        if seg_m <= 1e-9:
+            cur = nxt
+            continue
+        if seg_m <= budget_m:
+            budget_m -= seg_m
+            cur = nxt
+        else:                                   # partial step into this segment
+            t = budget_m / seg_m
+            cur = cur + t * (nxt - cur)
+            budget_m = 0.0
+            break
+    return (float(cur[0]), float(cur[1]))
 
 
 # ==============================================================================

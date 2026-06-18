@@ -1028,6 +1028,45 @@ def _greedy_then_2opt(coords: np.ndarray, max_iter: int = 200) -> List[int]:
     return tour
 
 
+def _mdp_policy_rollout(
+    V: np.ndarray,
+    mask: np.ndarray,
+    start_rc: Tuple[int, int],
+    n_steps: int,
+) -> List[Tuple[int, int]]:
+    """Greedy steepest-ascent rollout of the MDP-optimal policy over value V.
+
+    From `start_rc`, repeatedly step to the highest-value 8-connected, in-polygon,
+    not-yet-visited neighbour. This climbs the value surface toward the herd peak
+    and then traces a ring around it (the visited set forces it outward into an
+    orbit). Returns up to `n_steps` (row, col) cells AHEAD of the drone — the
+    start cell itself is never included, so the drone always has somewhere to go.
+    """
+    ny, nx = V.shape
+    sr, sc = start_rc
+    sr = int(np.clip(sr, 0, ny - 1))
+    sc = int(np.clip(sc, 0, nx - 1))
+    visited = {(sr, sc)}
+    cur = (sr, sc)
+    path: List[Tuple[int, int]] = []
+    neigh = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    for _ in range(int(n_steps)):
+        best = None
+        best_v = -np.inf
+        for dr, dc in neigh:
+            r, c = cur[0] + dr, cur[1] + dc
+            if 0 <= r < ny and 0 <= c < nx and mask[r, c] and (r, c) not in visited:
+                if V[r, c] > best_v:
+                    best_v = V[r, c]
+                    best = (r, c)
+        if best is None:
+            break
+        path.append(best)
+        visited.add(best)
+        cur = best
+    return path
+
+
 def plan_receding_horizon(
     risk: np.ndarray,
     envelope: Dict[str, np.ndarray],
@@ -1041,9 +1080,13 @@ def plan_receding_horizon(
     waypoints, never a full static tour (architecture: static planning forbidden).
 
     Method:
-      1. MDP value iteration ranks cells by long-horizon reachable risk.
-      2. Take the top `n_candidates` in-polygon cells (the current information
-         frontier) near the drone, weighted by value AND proximity.
+      1. MDP value iteration ranks cells by long-horizon reachable risk; the
+         value peak sits on the herd hotspot.
+      2. Take the top `n_candidates` in-polygon cells by value, with a *gentle*
+         pasture-scale distance preference so the drone is drawn toward the
+         hotspot (and its near flank) rather than trapped locally. The drone's
+         OWN cell is explicitly excluded, so a waypoint is always somewhere to
+         travel TO — never "stay put".
       3. Order them into a fluid flight string with the native TSP heuristic
          (MTSP degenerates to a single salesperson for one drone).
       4. Attach per-cell altitude & velocity from the hardware envelope.
@@ -1054,36 +1097,24 @@ def plan_receding_horizon(
     ny, nx = risk.shape
 
     V = mdp_value_iteration(risk, grid.mask)
-
-    # Drone position in local metres.
-    dx, dy = grid.lonlat_to_xy(np.array([drone_lonlat[0]]), np.array([drone_lonlat[1]]))
-    drone_xy = np.array([dx[0], dy[0]])
-
-    GX, GY = grid.mesh_xy()
-    valid_idx = np.argwhere(grid.mask)
-    if valid_idx.size == 0:
+    if not grid.mask.any():
         return []
 
-    # Score = MDP value discounted by travel distance from the drone.
-    cell_xy = np.column_stack([GX[grid.mask], GY[grid.mask]])
-    dist = np.linalg.norm(cell_xy - drone_xy[None, :], axis=1)
-    dist_scale = max(grid.cell_size_m * 4.0, 50.0)
-    score = V[grid.mask] * np.exp(-dist / dist_scale)
+    # The drone's current grid cell (nearest centre).
+    d_rx = int(np.argmin(np.abs(grid.lons - drone_lonlat[0])))
+    d_ry = int(np.argmin(np.abs(grid.lats - drone_lonlat[1])))
 
-    n_take = min(n_candidates, score.size)
-    top = np.argsort(score)[::-1][:n_take]
-    cand_rows = valid_idx[top]            # (n_take, 2) -> (row=y, col=x)
-    cand_xy = cell_xy[top]
-
-    # Order candidates into a smooth string, starting from the drone.
-    coords = np.vstack([drone_xy, cand_xy])
-    order = _greedy_then_2opt(coords)
-    # Drop the drone's own start node, keep the planned visiting order.
-    ordered_cand = [i - 1 for i in order if i != 0]
+    # Roll out the MDP-optimal policy (greedy steepest-ascent on V) from the
+    # drone cell. The value field peaks on the herd, so the rollout climbs
+    # monotonically toward the herd and then circles it: a STABLE goal-directed
+    # track that never oscillates in place. This is the native MTSP/MDP engine
+    # collapsed to a single-agent rolling horizon.
+    cells = _mdp_policy_rollout(V, grid.mask, (d_ry, d_rx), n_waypoints)
+    if not cells:
+        return []
 
     waypoints: List[Dict[str, float]] = []
-    for ci in ordered_cand[:n_waypoints]:
-        ry, rx = cand_rows[ci]
+    for ry, rx in cells:
         waypoints.append({
             "lat": float(grid.lats[ry]),
             "lon": float(grid.lons[rx]),
