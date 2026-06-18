@@ -738,9 +738,9 @@ if not is_sim:
 
 layers = []
 
-# 1) Risk heatmap — coloured by the V2.0 dynamic risk (Forest × Herd). Deep
-#    crimson concentrates on the forest edge nearest the herd (the active danger
-#    zone) and travels with the animals; green/yellow elsewhere.
+# 1) Risk heatmap — coloured by the Bodyguard-Mode risk (herd-centred). Deep
+#    crimson sits directly ON the herd and travels with the animals; the forest
+#    only gently amplifies the flank facing the tree line.
 _ELEV_SCALE = 90.0 if show_3d else 0.0
 heat_records = build_heatmap_records(
     result.grid, result.risk,
@@ -915,9 +915,9 @@ st.markdown(
                   background:linear-gradient(90deg, {RISK_GRADIENT_CSS});"></div>
       <div style="display:flex;justify-content:space-between;
                   font-size:0.78rem;color:#cfcfcf;margin-top:3px;">
-        <span>🟢 Safe</span>
-        <span>🟡 Herd in the open</span>
-        <span>🔴 High — forest edge nearest the herd (active danger zone)</span>
+        <span>🟢 Safe / open ground</span>
+        <span>🟡 Herd vicinity</span>
+        <span>🔴 High — directly over the herd (Bodyguard)</span>
       </div>
     </div>
     """,
@@ -977,13 +977,13 @@ with right:
     st.markdown(
         f"""
         <div style="font-size:0.85rem;color:#cfcfcf;margin-bottom:6px;">
-          <b>Risk grid</b> — cell colour = <i>Forest&nbsp;×&nbsp;Herd</i> risk:
+          <b>Risk grid</b> — cell colour = <i>herd-centred (Bodyguard)</i> risk:
         </div>
         <div style="height:14px;border-radius:7px;border:1px solid #ffffff33;
                     background:linear-gradient(90deg, {RISK_GRADIENT_CSS});"></div>
         <div style="display:flex;justify-content:space-between;font-size:0.72rem;
                     color:#bbb;margin:2px 0 10px 0;">
-          <span>safe</span><span>forest edge by the herd</span>
+          <span>safe</span><span>over the herd</span>
         </div>
         {rows_html}
         """,
@@ -999,9 +999,10 @@ with right:
 with st.expander("ℹ️ How the pipeline reacts to your controls"):
     st.markdown(
         """
-        * **V2.0 dynamic risk** = *Forest proximity × Herd proximity*. The peak
-          risk concentrates on the forest edge **closest to the herd**, so as the
-          animals move the red hotspots — and the spline flight path — follow them.
+        * **Bodyguard Mode** — risk is centred on the **herd** (`livestock_gain ·
+          H · (1 + forest_boost · F)`). The peak sits directly over the animals,
+          so the spline path flies tight, continuous curves over / circling the
+          herd as it moves; the forest only gently amplifies the threatened flank.
         * **Hardware sliders** re-derive the per-cell *flight envelope* instantly:
           lower `min wolf px` / higher altitude ⇒ faster flight; a larger
           *weather/visibility buffer* forces more image overlap ⇒ the drone flies

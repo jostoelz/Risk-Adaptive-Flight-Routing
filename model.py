@@ -819,39 +819,40 @@ def combine_risk(
     livestock_gain: float = 2.5,
     threat_field: Optional[np.ndarray] = None,
     threat_weight: float = 25.0,
-    w_couple: float = 1.0,
-    w_herd: float = 0.35,
-    w_static: float = 0.15,
+    forest_boost: float = 0.30,
+    w_static: float = 0.08,
 ) -> np.ndarray:
     """
-    V2.0 dynamic risk: couple the continuous forest-edge field to the live herd.
+    PHILOSOPHY A — "Bodyguard Mode": the risk objective is centred on the herd.
 
-        coupled  = forest_proximity * herd_proximity     # forest edge NEAR herd
-        dynamic  = w_couple * coupled + w_herd * herd_proximity
-        risk_raw = livestock_gain * dynamic + w_static * baseline_gpr
-                   (+ threat_weight * wolf_threat,  when a wolf is active)
-        risk     = (risk_raw - min) / (max - min)         # strictly -> [0, 1]
+        herd_core = herd_proximity * (1 + forest_boost * forest_proximity)
+        risk_raw  = livestock_gain * herd_core + w_static * baseline_gpr
+                    (+ threat_weight * wolf_threat,  when a wolf is active)
+        risk      = (risk_raw - min) / (max - min)          # strictly -> [0, 1]
 
-    Why this shape (architecture V2.0):
-      * The PRODUCT term concentrates the absolute peak risk on the stretch of
-        forest edge closest to the herd — the active danger zone — instead of
-        lighting up the whole boundary.
-      * The herd term keeps the drone near the animals even in open ground.
-      * The faint static term preserves creek/hedge structure.
-    Because herd_proximity is recomputed from live coordinates each cycle, the
-    hotspots shift with the herd and the RHC planner re-routes to follow them.
+    Design (Bodyguard):
+      * The HERD field H is the dominant driver, so the absolute peak risk sits
+        directly ON the herd — the drone is commanded to fly over / tightly circle
+        the animals rather than loiter at the forest border.
+      * The forest field acts only as a MINOR MULTIPLIER (1 + forest_boost * F),
+        gently emphasising the flank of the herd that faces the tree line; it can
+        never out-score the herd itself.
+      * There is no forest-only additive term: away from the herd the forest edge
+        carries essentially no patrol value (only the faint w_static structure).
+    Because H is recomputed from live coordinates each cycle, the deep-crimson
+    hotspot moves with the herd and the RHC planner re-routes to stay on top of it.
 
-    The matrix is strictly min-max normalised to [0, 1] to prevent overflow; an
-    active wolf threat is added with a large weight so it dominates locally.
+    The matrix is strictly min-max normalised to [0, 1]; an active wolf threat is
+    added with a large weight so it dominates locally.
     """
     F = np.clip(np.nan_to_num(forest_proximity, nan=0.0), 0.0, 1.0)
     H = np.clip(np.nan_to_num(herd_proximity, nan=0.0), 0.0, 1.0)
     B = np.clip(np.nan_to_num(baseline_gpr, nan=0.0), 0.0, 1.0)
     g = float(np.clip(livestock_gain, 0.0, 10.0))
+    fb = float(max(forest_boost, 0.0))
 
-    coupled = F * H                                   # forest ∩ herd hotspot
-    dynamic = w_couple * coupled + w_herd * H
-    risk_raw = g * dynamic + w_static * B
+    herd_core = H * (1.0 + fb * F)          # herd-centred; forest only amplifies
+    risk_raw = g * herd_core + float(max(w_static, 0.0)) * B
 
     if threat_field is not None:
         tf = np.clip(np.nan_to_num(threat_field, nan=0.0), 0.0, 1.0)
