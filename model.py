@@ -805,19 +805,22 @@ def select_focus_cluster(
     min_separation_m: float = 45.0,
     gap_factor: float = 2.2,
     scatter_spread_m: float = SCATTER_SPREAD_M,
+    force_scattered: bool = False,
 ) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], str,
            Optional[np.ndarray], Optional[Tuple[float, float]]]:
     """
     Classify the herd and pick what the drone should track. Three states:
 
-      * SPLIT     -- two clean SVD clusters (largest principal-axis gap is clearly
-                     bimodal AND the groups are far apart). The planner locks onto
-                     ONE group with hysteresis (no mid-saddle jitter); the chosen
-                     group's centroid is returned for the lock.
-      * SCATTERED -- no clean split AND the omnidirectional RMS spread exceeds
-                     `scatter_spread_m`. Single-animal locking is disabled; the
-                     whole herd is returned so a wide KDE covers the area and the
-                     drone runs an area-coverage sweep instead of orbiting a dot.
+      * SCATTERED -- checked FIRST as a hard override: if `force_scattered` is set
+                     (the scenario is explicitly Scattered) OR the omnidirectional
+                     RMS spread exceeds `scatter_spread_m`, the SVD split check and
+                     all cluster-locking are COMPLETELY BYPASSED. The whole herd is
+                     returned (no sub-sampling, no lock) so a wide KDE covers the
+                     field and the drone area-sweeps. This stops the mode-collision
+                     flip-flop where a stochastic gap spuriously triggered a split.
+      * SPLIT     -- only reachable when NOT scattered: two clean SVD clusters
+                     (largest principal-axis gap clearly bimodal AND groups far
+                     apart). Locks onto ONE group with hysteresis.
       * COMPACT   -- a single tight cluster -> orbit its centroid.
 
     Returns (subset_lonlat, chosen_centroid, state, guarded_mask, other_centroid):
@@ -846,23 +849,30 @@ def select_focus_cluster(
     X = np.column_stack([(pts[:, 0] - c[0]) * mlon, (pts[:, 1] - c[1]) * mlat])
     spread_m = float(np.sqrt(np.mean(np.sum(X ** 2, axis=1)))) if n else 0.0
 
-    def _scattered_or_compact():
-        state = STATE_SCATTERED if spread_m > scatter_spread_m else STATE_COMPACT
-        return pts, None, state, np.ones(n, dtype=bool), None
+    # --- HARD SCATTERED OVERRIDE (checked before any SVD / lock) ---------------
+    # An explicit Scattered scenario, or genuinely wide dispersion, forces the
+    # area-coverage state. We skip the SVD entirely and return ALL coordinates
+    # with NO lock, so minor stochastic motion can never flip us into Split-lock.
+    if force_scattered or spread_m > scatter_spread_m:
+        return pts, None, STATE_SCATTERED, np.ones(n, dtype=bool), None
+
+    # Below here the herd is NOT scattered -> any fallback collapses to COMPACT.
+    def _compact():
+        return pts, None, STATE_COMPACT, np.ones(n, dtype=bool), None
 
     if n < 4 or drone_lonlat is None:
-        return _scattered_or_compact()
+        return _compact()
 
     # Try a clean two-cluster split along the principal axis (largest gap).
     try:
         _, _, vt = np.linalg.svd(X, full_matrices=False)
     except Exception:
-        return _scattered_or_compact()
+        return _compact()
     proj = X @ vt[0]
     order = np.argsort(proj)
     gaps = np.diff(proj[order])
     if gaps.size == 0:
-        return _scattered_or_compact()
+        return _compact()
     gi = int(np.argmax(gaps))
     max_gap = float(gaps[gi])
     med_gap = float(np.median(gaps))
@@ -870,14 +880,13 @@ def select_focus_cluster(
 
     idx_a, idx_b = order[:gi + 1], order[gi + 1:]
     if idx_a.size < 2 or idx_b.size < 2:
-        return _scattered_or_compact()
+        return _compact()
 
     ca = tuple(pts[idx_a].mean(axis=0))
     cb = tuple(pts[idx_b].mean(axis=0))
     sep_m = _m(ca, cb)
     if not (max_gap > gap_factor * med_gap and sep_m > min_separation_m):
-        # Not two clean clusters -> scattered (if wide) or compact.
-        return _scattered_or_compact()
+        return _compact()
 
     da, db = _m(ca, drone_lonlat), _m(cb, drone_lonlat)
 
@@ -1455,6 +1464,7 @@ class RiskModel:
         livestock_lonlat: Optional[np.ndarray],
         drone_lonlat: Tuple[float, float],
         n_waypoints: int = 4,
+        force_scattered: bool = False,
     ) -> RiskModelResult:
         """One receding-horizon cycle: recompute live risk and next waypoints.
 
@@ -1462,11 +1472,17 @@ class RiskModel:
           * COMPACT / SPLIT -> Orbit Mode: a tight KDE around the (locked) cluster
             centroid; the planner flies a geometric bodyguard ring around it.
           * SCATTERED       -> Area-Coverage Mode: a deliberately wide KDE melts the
-            animals into one cloud and the MDP policy rollout sweeps the whole area.
+            animals into one cloud and a moving figure-8 target sweeps the field.
+
+        `force_scattered=True` (the scenario is explicitly Scattered) hard-locks
+        the SCATTERED state: SVD split detection and cluster-locking are bypassed,
+        eliminating the Area-Coverage <-> Split-lock flip-flop from stochastic
+        animal motion.
         """
         (focus_subset, focus_centroid, state,
          guarded_mask, other_centroid) = select_focus_cluster(
-            livestock_lonlat, drone_lonlat, self._locked_cluster_centroid)
+            livestock_lonlat, drone_lonlat, self._locked_cluster_centroid,
+            force_scattered=force_scattered)
         self._locked_cluster_centroid = focus_centroid
         is_split = state == STATE_SPLIT
         is_scattered = state == STATE_SCATTERED

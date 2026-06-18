@@ -537,10 +537,12 @@ if is_sim:
     herd = st.session_state.herd
     drone = st.session_state.drone
 
+    # Explicit Scattered scenario hard-locks the Area-Coverage state (no flip-flop).
     result = model.update(
         livestock_lonlat=herd,
         drone_lonlat=drone,
         n_waypoints=n_waypoints,
+        force_scattered=(scenario == "Scattered / Fragmented"),
     )
 
     # Fly the drone along the freshly planned path, then log the trajectory.
