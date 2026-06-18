@@ -538,11 +538,13 @@ if is_sim:
     drone = st.session_state.drone
 
     # Explicit Scattered scenario hard-locks the Area-Coverage state (no flip-flop).
+    # `tick` drives the Method-A figure-8 precession so the sweep covers the field.
     result = model.update(
         livestock_lonlat=herd,
         drone_lonlat=drone,
         n_waypoints=n_waypoints,
         force_scattered=(scenario == "Scattered / Fragmented"),
+        tick=int(st.session_state.tick),
     )
 
     # Fly the drone along the freshly planned path, then log the trajectory.
@@ -596,6 +598,7 @@ else:
         livestock_lonlat=(herd if len(herd) else None),
         drone_lonlat=drone,
         n_waypoints=n_waypoints,
+        tick=int(st.session_state.tick),
     )
 
     # ---- Drone Terminal: log the real pipeline events for this cycle ----
@@ -863,7 +866,7 @@ if len(trail) >= 2:
         "PathLayer",
         data=[{"path": trail_path}],
         get_path="path",
-        get_color=[255, 215, 0, 220],
+        get_color=[30, 41, 59, 235],   # deep slate (high contrast on light map)
         get_width=2.0,
         width_min_pixels=2,
         cap_rounded=True,
@@ -964,7 +967,7 @@ with right:
         (_dot("rgba(140,140,150,0.45)", "#666"), "Livestock — deprioritised (dimmed)"),
         (_dot("rgb(0,120,255)"), "Drone position"),
         (_dot("rgb(20,80,30)", "#dfffdf"), "OSM forest edge"),
-        (_line("rgb(255,215,0)"), "Flown path (B-spline)"),
+        (_line("rgb(30,41,59)"), "Flown path (B-spline)"),
         (_line("rgb(0,200,255)"), "Planned path (B-spline)"),
     ]
     rows_html = "".join(

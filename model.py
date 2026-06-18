@@ -1286,6 +1286,7 @@ def plan_orbit(
 # Area-coverage sweep tuning (SCATTERED state).
 SWEEP_PHASE_STEP = 0.13      # radians the lead target advances each scattered cycle
 SWEEP_LEAD = 0.38            # phase lead between successive sweep waypoints
+PRECESSION_RATE = 0.05       # Method A: Δφ per tick -> the figure-8 slowly rotates
 
 
 def plan_area_sweep(
@@ -1297,18 +1298,23 @@ def plan_area_sweep(
     envelope: Dict[str, np.ndarray],
     n_waypoints: int,
     phase: float,
+    precession: float = 0.0,
     lead: float = SWEEP_LEAD,
 ) -> List[Dict[str, float]]:
     """
-    Area-Coverage planner (SCATTERED state): a moving figure-8 sweep target.
+    Area-Coverage planner (SCATTERED state): a moving, ROTATING figure-8 target
+    (Method A — phase-shifting / rotating Lissajous).
 
-    A static centroid would make the drone freeze and circle one central point.
-    Instead we drive a DYNAMIC target along a wide horizontal figure-8 (a 1:2
-    Lissajous: x = half_x·sin t, y = half_y·sin 2t) centred on the herd centroid
-    and sized to the expanded KDE cloud. `phase` advances every cycle so the next
-    `n_waypoints` lead the drone along the curve, forcing it to generate large
-    sweeping area-coverage splines across the whole pasture rather than orbiting
-    a single coordinate. Waypoints are clamped to the grid (stay in the viewport).
+    We drive a dynamic target along a 1:2 Lissajous (figure-8):
+        bx = half_x·sin t ,  by = half_y·sin 2t        (t = phase + k·lead)
+    `phase` advances every cycle so the target leads the drone along the curve.
+    The whole curve is then rotated in space by the precession angle Δφ:
+        dx = bx·cos Δφ − by·sin Δφ
+        dy = bx·sin Δφ + by·cos Δφ
+    As Δφ = tick·PRECESSION_RATE grows, the figure-8's spatial orientation slowly
+    precesses, so the horizontal sweep lines shift vertically over time and the
+    previous blind/dead zones are continuously wiped — achieving full coverage of
+    the whole pasture meshgrid. Waypoints are clamped to the grid (stay in view).
 
     Output: list of {lat, lon, altitude_m, speed_ms, risk}.
     """
@@ -1318,6 +1324,7 @@ def plan_area_sweep(
     mlon = mlat * math.cos(math.radians(cy))
     ax = max(float(half_x_m), 20.0)
     ay = max(float(half_y_m), 15.0)
+    cos_p, sin_p = math.cos(precession), math.sin(precession)  # rotation by Δφ
 
     ny, nx = grid.shape
     lon_lo, lon_hi = float(grid.lons.min()), float(grid.lons.max())
@@ -1326,8 +1333,10 @@ def plan_area_sweep(
     waypoints: List[Dict[str, float]] = []
     for k in range(1, n + 1):
         t = phase + k * lead
-        dx = ax * math.sin(t)             # wide horizontal extent
-        dy = ay * math.sin(2.0 * t)       # 1:2 Lissajous -> figure-8 on its side
+        bx = ax * math.sin(t)             # base figure-8 (wide horizontal)
+        by = ay * math.sin(2.0 * t)       # 1:2 Lissajous -> 8 on its side
+        dx = bx * cos_p - by * sin_p      # rotate the curve by the precession Δφ
+        dy = bx * sin_p + by * cos_p
         wlon = min(max(cx + dx / mlon, lon_lo), lon_hi)
         wlat = min(max(cy + dy / mlat, lat_lo), lat_hi)
         rx = int(np.clip(np.argmin(np.abs(grid.lons - wlon)), 0, nx - 1))
@@ -1465,6 +1474,7 @@ class RiskModel:
         drone_lonlat: Tuple[float, float],
         n_waypoints: int = 4,
         force_scattered: bool = False,
+        tick: int = 0,
     ) -> RiskModelResult:
         """One receding-horizon cycle: recompute live risk and next waypoints.
 
@@ -1512,9 +1522,13 @@ class RiskModel:
             half_x = 0.9 * 0.5 * float(xs.max() - xs.min()) if pts.shape[0] > 1 else 0.0
             half_y = 0.9 * 0.5 * float(ys.max() - ys.min()) if pts.shape[0] > 1 else 0.0
             self._sweep_phase += SWEEP_PHASE_STEP
+            # Method A: rotate (precess) the figure-8 by Δφ = tick · 0.05 so the
+            # sweep orientation slowly turns and wipes out horizontal blind spots.
+            precession = float(tick) * PRECESSION_RATE
             waypoints = plan_area_sweep(
                 (float(cen[0]), float(cen[1])), half_x, half_y,
                 self.grid, risk, env, n_waypoints, self._sweep_phase,
+                precession=precession,
             )
         elif has_herd:
             cen = np.asarray(focus_subset, dtype=float).reshape(-1, 2).mean(axis=0)

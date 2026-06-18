@@ -125,11 +125,12 @@ class WaypointsResponse(BaseModel):
 # Core computation
 # ==============================================================================
 
-def _compute_waypoints_from_telemetry(tele: dict) -> List[dict]:
+def _compute_waypoints_from_telemetry(tele: dict, tick: int = 0) -> List[dict]:
     """Run one receding-horizon cycle on a stored telemetry packet.
 
     Converts wire [lat, lon] -> model (lon, lat), runs model.update, and returns
     the waypoint dicts (which already carry lat/lon/altitude_m/speed_ms/risk).
+    `tick` drives the scattered-state figure-8 precession (Method A).
     """
     model = get_model()
 
@@ -144,6 +145,7 @@ def _compute_waypoints_from_telemetry(tele: dict) -> List[dict]:
         livestock_lonlat=ll,
         drone_lonlat=drone_lonlat,
         n_waypoints=n,
+        tick=int(tick),
     )
     return result.waypoints
 
@@ -182,7 +184,8 @@ def update_herd(packet: HerdUpdate):
         drone_alt=packet.drone_alt,
         n_waypoints=packet.n_waypoints,
     )
-    waypoints = _compute_waypoints_from_telemetry(state["telemetry"])
+    waypoints = _compute_waypoints_from_telemetry(
+        state["telemetry"], tick=int(state["seq"]))
     rs.store_waypoints(waypoints)
 
     return WaypointsResponse(
@@ -213,7 +216,7 @@ def next_waypoints(n: Optional[int] = None):
     if n is not None:
         tele = {**tele, "n_waypoints": int(np.clip(n, 3, 5))}
 
-    waypoints = _compute_waypoints_from_telemetry(tele)
+    waypoints = _compute_waypoints_from_telemetry(tele, tick=int(state.get("seq", 0)))
     rs.store_waypoints(waypoints)
 
     return WaypointsResponse(
