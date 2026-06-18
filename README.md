@@ -1,6 +1,7 @@
 # 📘 Risk Adaptive Flight Routing
 ## 🔗 Online Access
 
+- Website of the project: https://risk-adaptive-flight-routing.streamlit.app/
 - This project was featured in the following thesis: <https://drive.google.com/drive/folders/1ag495ByeFjiVlfqUUsdaL6ZCu044Agzx>
 - GitHub Repository of the thesis: <https://github.com/jostoelz/Autonomous-Drone-System-for-Wolf-Detection-Deterrence-and-Sheep-Protection>
 
