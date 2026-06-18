@@ -101,30 +101,20 @@ def build_heatmap_records(
     forest_prox: np.ndarray = None,
     forest_dist: np.ndarray = None,
     elevation_scale: float = 0.0,
-    guarded_centroid=None,
-    other_centroid=None,
     altitude: np.ndarray = None,
     velocity: np.ndarray = None,
 ) -> List[dict]:
     """One filled square polygon per in-polygon cell.
 
-    `elevation_scale` > 0 extrudes the cell into a 3D risk surface. When a split
-    herd is being guarded (`guarded_centroid` and `other_centroid` both given),
-    cells on the deprioritised side of the perpendicular bisector are rendered
-    fully transparent, so the crimson danger zone only covers the guarded cluster.
+    The meshgrid spans the FULL field, so every in-polygon cell is always emitted
+    and the heatmap is seamless across the whole viewport — even during a
+    sub-cluster lock. Deprioritised animals simply produce near-zero KDE values
+    (the locked subset excludes them), so their region renders cool/transparent
+    via the alpha-by-risk colour ramp rather than being hard-clipped.
+    `elevation_scale` > 0 extrudes the cell into a 3D risk surface.
     """
     lon_edges, lat_edges = grid.cell_edges()
     ny, nx = grid.shape
-
-    # Local lon scale (for the split bisector distance comparison).
-    lat_mid = float(np.mean(grid.lats))
-    lon_scale = math.cos(math.radians(lat_mid))
-    split_active = guarded_centroid is not None and other_centroid is not None
-
-    def _on_deprioritised_side(clon, clat):
-        dg = ((clon - guarded_centroid[0]) * lon_scale) ** 2 + (clat - guarded_centroid[1]) ** 2
-        do = ((clon - other_centroid[0]) * lon_scale) ** 2 + (clat - other_centroid[1]) ** 2
-        return do < dg
 
     records: List[dict] = []
     for ry in range(ny):
@@ -136,10 +126,6 @@ def build_heatmap_records(
             lon0, lon1 = lon_edges[rx], lon_edges[rx + 1]
             lat0, lat1 = lat_edges[ry], lat_edges[ry + 1]
             color = risk_to_rgba(disp)
-            if split_active:
-                clon, clat = 0.5 * (lon0 + lon1), 0.5 * (lat0 + lat1)
-                if _on_deprioritised_side(clon, clat):
-                    color = [color[0], color[1], color[2], 0]  # fully transparent
             if forest_dist is not None and np.isfinite(forest_dist[ry, rx]):
                 fm = round(float(forest_dist[ry, rx]), 1)
             else:
@@ -650,7 +636,13 @@ else:
     patrol_mode = "🛡️ Bodyguard Orbit"
 n_livestock = int(len(herd)) if herd is not None else 0
 
-m1, m2, m3, m4, m5 = st.columns(5)
+# Shrink the metric value font slightly so the longest patrol-mode string
+# ("Area Coverage") never truncates, and give that card extra column width.
+st.markdown(
+    "<style>[data-testid='stMetricValue']{font-size:1.0rem;line-height:1.25;}</style>",
+    unsafe_allow_html=True,
+)
+m1, m2, m3, m4, m5 = st.columns([1.7, 1, 1, 1, 1])
 m1.metric("Patrol mode", patrol_mode)
 m2.metric("Max detection alt.", f"{result.h_max_m:.1f} m")
 m3.metric("Min safe alt.", f"{result.h_min_m:.1f} m")
@@ -727,16 +719,14 @@ if not is_sim:
 
 layers = []
 
-# 1) Risk heatmap — coloured by the Bodyguard-Mode risk (herd-centred). Deep
-#    crimson sits directly ON the herd and travels with the animals; the forest
-#    only gently amplifies the flank facing the tree line.
+# 1) Risk heatmap — coloured by the Bodyguard-Mode risk (herd-centred), spanning
+#    the full grid seamlessly. Deprioritised clusters simply read near-zero (cool)
+#    rather than being hard-clipped, so the grid stays intact across the viewport.
 _ELEV_SCALE = 90.0 if show_3d else 0.0
 heat_records = build_heatmap_records(
     result.grid, result.risk,
     forest_dist=result.forest_distance_m,
     elevation_scale=_ELEV_SCALE,
-    guarded_centroid=(result.guarded_centroid if result.is_split else None),
-    other_centroid=(result.other_centroid if result.is_split else None),
     altitude=result.altitude_m,
     velocity=result.velocity_ms,
 )

@@ -1274,6 +1274,65 @@ def plan_orbit(
     return waypoints
 
 
+# Area-coverage sweep tuning (SCATTERED state).
+SWEEP_PHASE_STEP = 0.13      # radians the lead target advances each scattered cycle
+SWEEP_LEAD = 0.38            # phase lead between successive sweep waypoints
+
+
+def plan_area_sweep(
+    centroid_lonlat: Tuple[float, float],
+    half_x_m: float,
+    half_y_m: float,
+    grid: Grid,
+    risk: np.ndarray,
+    envelope: Dict[str, np.ndarray],
+    n_waypoints: int,
+    phase: float,
+    lead: float = SWEEP_LEAD,
+) -> List[Dict[str, float]]:
+    """
+    Area-Coverage planner (SCATTERED state): a moving figure-8 sweep target.
+
+    A static centroid would make the drone freeze and circle one central point.
+    Instead we drive a DYNAMIC target along a wide horizontal figure-8 (a 1:2
+    Lissajous: x = half_x·sin t, y = half_y·sin 2t) centred on the herd centroid
+    and sized to the expanded KDE cloud. `phase` advances every cycle so the next
+    `n_waypoints` lead the drone along the curve, forcing it to generate large
+    sweeping area-coverage splines across the whole pasture rather than orbiting
+    a single coordinate. Waypoints are clamped to the grid (stay in the viewport).
+
+    Output: list of {lat, lon, altitude_m, speed_ms, risk}.
+    """
+    n = int(np.clip(n_waypoints, 3, 5))
+    cx, cy = float(centroid_lonlat[0]), float(centroid_lonlat[1])
+    mlat = math.radians(1.0) * _EARTH_RADIUS_M
+    mlon = mlat * math.cos(math.radians(cy))
+    ax = max(float(half_x_m), 20.0)
+    ay = max(float(half_y_m), 15.0)
+
+    ny, nx = grid.shape
+    lon_lo, lon_hi = float(grid.lons.min()), float(grid.lons.max())
+    lat_lo, lat_hi = float(grid.lats.min()), float(grid.lats.max())
+
+    waypoints: List[Dict[str, float]] = []
+    for k in range(1, n + 1):
+        t = phase + k * lead
+        dx = ax * math.sin(t)             # wide horizontal extent
+        dy = ay * math.sin(2.0 * t)       # 1:2 Lissajous -> figure-8 on its side
+        wlon = min(max(cx + dx / mlon, lon_lo), lon_hi)
+        wlat = min(max(cy + dy / mlat, lat_lo), lat_hi)
+        rx = int(np.clip(np.argmin(np.abs(grid.lons - wlon)), 0, nx - 1))
+        ry = int(np.clip(np.argmin(np.abs(grid.lats - wlat)), 0, ny - 1))
+        waypoints.append({
+            "lat": float(wlat),
+            "lon": float(wlon),
+            "altitude_m": float(envelope["altitude_m"][ry, rx]),
+            "speed_ms": float(envelope["velocity_ms"][ry, rx]),
+            "risk": float(risk[ry, rx]),
+        })
+    return waypoints
+
+
 # ==============================================================================
 # 8b. AERODYNAMIC PATH SMOOTHING  (Cubic spline over the RHC/TSP waypoints)
 # ==============================================================================
@@ -1388,6 +1447,8 @@ class RiskModel:
             np.maximum(self.baseline_gpr, self.forest_proximity), 0.0, 1.0)
         # Hysteresis lock for split-herd tracking (which sub-group we guard).
         self._locked_cluster_centroid: Optional[Tuple[float, float]] = None
+        # Advancing phase for the SCATTERED-state figure-8 area-coverage sweep.
+        self._sweep_phase: float = 0.0
 
     def update(
         self,
@@ -1419,16 +1480,30 @@ class RiskModel:
         )
         env = compute_flight_envelope(risk, self.hw)
 
-        # Adaptive planner: Orbit Mode rings a compact/locked cluster; Area-Coverage
-        # Mode lets the MDP policy rollout sweep the broad scattered field.
-        orbit_center = None
-        if not is_scattered and focus_subset is not None and len(focus_subset) > 0:
+        # Adaptive planner:
+        #   SCATTERED        -> Area-Coverage: a moving figure-8 sweep target so the
+        #                       drone draws large sweeping curves (never freezes).
+        #   COMPACT / SPLIT  -> Orbit Mode: a tight geometric ring on the centroid.
+        #   no herd          -> MDP policy rollout (patrol).
+        has_herd = focus_subset is not None and len(focus_subset) > 0
+        if is_scattered and has_herd:
+            pts = np.asarray(focus_subset, dtype=float).reshape(-1, 2)
+            cen = pts.mean(axis=0)
+            mlat = math.radians(1.0) * _EARTH_RADIUS_M
+            mlon = mlat * math.cos(math.radians(float(cen[1])))
+            xs = (pts[:, 0] - cen[0]) * mlon
+            ys = (pts[:, 1] - cen[1]) * mlat
+            half_x = 0.9 * 0.5 * float(xs.max() - xs.min()) if pts.shape[0] > 1 else 0.0
+            half_y = 0.9 * 0.5 * float(ys.max() - ys.min()) if pts.shape[0] > 1 else 0.0
+            self._sweep_phase += SWEEP_PHASE_STEP
+            waypoints = plan_area_sweep(
+                (float(cen[0]), float(cen[1])), half_x, half_y,
+                self.grid, risk, env, n_waypoints, self._sweep_phase,
+            )
+        elif has_herd:
             cen = np.asarray(focus_subset, dtype=float).reshape(-1, 2).mean(axis=0)
-            orbit_center = (float(cen[0]), float(cen[1]))
-
-        if orbit_center is not None:
             waypoints = plan_orbit(
-                orbit_center, drone_lonlat, self.grid, risk, env,
+                (float(cen[0]), float(cen[1])), drone_lonlat, self.grid, risk, env,
                 n_waypoints=n_waypoints, radius_m=self.orbit_radius_m,
             )
         else:
