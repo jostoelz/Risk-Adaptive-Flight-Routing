@@ -2,7 +2,20 @@
   "permissions": {
     "allow": [
       "Bash(mkdir -p \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context\")",
-      "Bash(touch \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context/hardware_constraints.txt\" \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context/math_formulas.txt\")"
+      "Bash(touch \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context/hardware_constraints.txt\" \"C:/Users/johan/OneDrive - Kantonsschule Romanshorn/Privat/Maturaarbeit/ETH-AI-Sprint/agent_context/math_formulas.txt\")",
+      "PowerShell(python -c \"import numpy, scipy, sklearn; print\\('numpy', numpy.__version__\\); print\\('scipy', scipy.__version__\\); print\\('sklearn', sklearn.__version__\\)\")",
+      "PowerShell(python -c \"import numpy, scipy; print\\('numpy', numpy.__version__\\); print\\('scipy', scipy.__version__\\)\"; python --version)",
+      "PowerShell(python -m pip install scikit-learn --quiet 2>&1 | Select-Object -Last 5)",
+      "PowerShell(python -c \"import sklearn; print\\('sklearn', sklearn.__version__\\)\")",
+      "PowerShell(python model.py)",
+      "PowerShell(python model.py 2>&1 | Select-Object -Last 20)",
+      "PowerShell(python -c \"import streamlit; print\\('streamlit', streamlit.__version__\\)\"; python -c \"import pydeck; print\\('pydeck', pydeck.__version__\\)\"; python -c \"import pandas; print\\('pandas', pandas.__version__\\)\")",
+      "PowerShell(python _smoke_test.py 2>&1 | Select-Object -Last 25)",
+      "PowerShell($env:BROWSER=\"none\"; Start-Process -FilePath \"python\" -ArgumentList \"-m\",\"streamlit\",\"run\",\"app.py\",\"--server.headless=true\",\"--server.port=8765\",\"--browser.gatherUsageStats=false\" -RedirectStandardOutput \"_st_out.log\" -RedirectStandardError \"_st_err.log\" -WindowStyle Hidden; Write-Output \"started\")",
+      "PowerShell($ok=$false; for \\($i=0; $i -lt 20; $i++\\) { try { $r = Invoke-WebRequest -Uri \"http://localhost:8765/_stcore/health\" -UseBasicParsing -TimeoutSec 2; if \\($r.StatusCode -eq 200\\) { Write-Output \"HEALTH: $\\($r.Content\\)\"; $ok=$true; break } } catch { Start-Sleep -Milliseconds 800 } }; if \\(-not $ok\\) { Write-Output \"no health yet\" })",
+      "PowerShell(python -m py_compile app.py model.py; if \\($?\\) { Write-Output \"compile OK\" }; try { $r = Invoke-WebRequest -Uri \"http://localhost:8765/_stcore/health\" -UseBasicParsing -TimeoutSec 3; Write-Output \"server health: $\\($r.Content\\)\" } catch { Write-Output \"server down\" })",
+      "PowerShell(python -c \"import fastapi, uvicorn, pydantic; print\\('fastapi', fastapi.__version__, '| uvicorn', uvicorn.__version__, '| pydantic', pydantic.__version__\\)\")",
+      "PowerShell($env:BROWSER=\"none\"; Start-Process -FilePath \"python\" -ArgumentList \"-m\",\"streamlit\",\"run\",\"app.py\",\"--server.headless=true\",\"--server.port=8766\",\"--browser.gatherUsageStats=false\" -RedirectStandardOutput \"_st2_out.log\" -RedirectStandardError \"_st2_err.log\" -WindowStyle Hidden; $ok=$false; for \\($i=0; $i -lt 25; $i++\\) { try { $r = Invoke-WebRequest -Uri \"http://localhost:8766/_stcore/health\" -UseBasicParsing -TimeoutSec 2; if \\($r.StatusCode -eq 200\\) { Write-Output \"HEALTH: $\\($r.Content\\)\"; $ok=$true; break } } catch { Start-Sleep -Milliseconds 800 } }; if \\(-not $ok\\) { Write-Output \"no health\" })"
     ]
   }
 }

@@ -1,0 +1,26 @@
+# ETH AI Sprint -- Autonomous Risk-Based Drone Patrolling
+# Full stack: mathematical core (model.py) + Streamlit dashboard (app.py)
+# + FastAPI Ground Control Station (api.py). One-click Streamlit Cloud ready.
+
+# --- Mathematical core (model.py) ---
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+
+# --- Geospatial feature fetch (Rule 1) ---
+# osmnx is the primary OpenStreetMap backend; overpy is the lightweight
+# fallback. The model degrades gracefully to synthetic features if neither
+# is importable, so on a constrained Streamlit Community Cloud build you may
+# comment osmnx out. osmnx pulls in shapely + geopandas.
+osmnx>=1.9
+# overpy>=0.6   # uncomment to use the Overpass fallback instead of osmnx
+
+# --- Dashboard UI (app.py) ---
+streamlit>=1.30
+pydeck>=0.9
+pandas>=2.0
+
+# --- Ground Control Station API (api.py, REAL DRONE MODE) ---
+fastapi>=0.110
+uvicorn>=0.27
+pydantic>=2.0

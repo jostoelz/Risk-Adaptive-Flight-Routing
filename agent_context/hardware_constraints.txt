@@ -1,0 +1,34 @@
+[CAMERA_AND_EDGE_AI]
+# Camera Field of View (FoV) in degrees
+CAMERA_FOV_HORIZONTAL_DEG = 75.0       # e.g., 75.0
+CAMERA_FOV_VERTICAL_DEG = 50.0         # e.g., 50.0
+
+# Camera sensor resolution in pixels
+CAMERA_RESOLUTION_WIDTH_PX = 1920 # e.g., 1920
+CAMERA_RESOLUTION_HEIGHT_PX = 1080      # e.g., 1080
+
+# Hard limit of the Edge AI object detection pipeline on Raspberry Pi
+RASPBERRY_PI_INFERENCE_RATE_FPS = 1.12       # Fixed hardware constraint
+
+# AI Model Requirement: Minimum pixel size of a wolf on the sensor for reliable detection
+MIN_DETECTION_SIZE_WOLF_PX = 40 # e.g., 40 (defines max flight altitude)
+
+
+[DRONE_PHYSICS]
+# Maximum safe flight velocity allowed by the drone hardware/motors
+DRONE_MAX_VELOCITY_MS = 15 # e.g., 15.0 (meters per second)
+
+# Maximum flight time on a single battery charge under standard conditions
+DRONE_MAX_BATTERY_LIFE_MIN = 25.0      # e.g., 25.0 (minutes)
+
+# Physical acceleration and deceleration limits (used to calculate energy loss during turns)
+DRONE_ACCELERATION_LIMIT_MS2 = 2.5    # e.g., 2.5 (meters per second squared)
+DRONE_DECELERATION_LIMIT_MS2 = 2.5    # e.g., 2.5
+
+
+[SAFETY_AND_ENVIRONMENTAL_LIMITS]
+# Minimum clearance height above any detected obstacles (trees, power masts, buildings)
+MIN_SAFETY_ALTITUDE_ABOVE_OBSTACLES_M = 8  # e.g., 10.0 (meters)
+
+# Default safety overlap factor for images to eliminate blind spots under perfect visibility
+DEFAULT_IMAGE_OVERLAP_PERCENTAGE = 20.0      # Expressed as a float (e.g., 20.0 for 20%)

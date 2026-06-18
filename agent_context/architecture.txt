@@ -1,0 +1,58 @@
+# ==============================================================================
+# SYSTEM ARCHITECTURE & MATHEMATICAL PIPELINE
+# Project: Autonomous Risk-Based Drone Patrolling using Informative Path Planning
+# Target Event: ETH AI Sprint (June 18, 2026)
+# ==============================================================================
+
+[SYSTEM CORE CONCEPT]
+The system dynamically calculates a 3D drone flight path based on real-time risk evaluation, rather than using a static pre-calculated grid. It prioritizes areas with a high probability of wolf intrusion (forest edges, natural cover) and dense livestock clusters while adhering strictly to hardware and edge computing limitations.
+
+
+[MATHEMATICAL PIPELINE & ALGORITHMS]
+
+1. RISK MAP GENERATION (Grid-Based Probability Matrix)
+- Spatial Discretization: The pasture (defined by polygon coordinates) is divided into a fine 2D grid of small squares (cells).
+- Static Risk Features: The system automatically fetches local environmental features (forest edges, creeks, hedges) using geospatial APIs (OpenStreetMap via OSMnx/Overpy) based on the user-defined pasture polygon. No manual feature drawing is required.
+- Baseline Algorithm: GaussianProcessRegressor (from scikit-learn) interpolates these spatial parameters to create a smooth, continuous baseline risk heatmap.
+
+2. LIVE LIVESTOCK DENSITY TRACKING
+- Input: Live GPS coordinates of livestock (assuming IoT tracking chips on animals).
+- Density Estimation: Kernel Density Estimation (KDE) from scipy.stats processes the coordinate cloud to find herd clusters. High-density animal clusters exponentially scale the underlying baseline cell risk values.
+
+3. INFORMATIVE PATH PLANNING & PATH OPTIMIZATION
+- Core Methodology: Information Gain / Ergodicity Optimization.
+- Path Generation: Uses Ergodic Coverage principles (ergodic_coverage) to ensure the drone's time spent in a cell is directly proportional to that cell's risk value. High-risk zones are scanned frequently; low-risk zones are checked rarely.
+- Alternate Trajectory Engine: Graph-based routing mapping the grid into a Network Graph. Relies on a combination of Markov Decision Processes (MDP) for next-best-cell prediction and a Multiple Traveling Salesperson (MTSP) algorithm to connect chosen high-risk nodes into a fluid flight string.
+- Hardware Alignment: Integrates hardware constraints (Camera FoV, 1.12 FPS processing limit, battery discharge, turning acceleration) into the calculation loop to maximize velocity without creating physical blind spots.
+
+
+[SYSTEM RUNTIME ARCHITECTURE - DUAL MODES]
+
+1. SIMULATION MODE (Default for Live Jury Demonstration)
+- The app synthetically generates coordinate paths mimicking real livestock movement and clustering.
+- User Interface includes an active interaction element to trigger a "virtual wolf spawn" event.
+- The entire path planning loop runs inside the web frontend loop for high-frequency visualization.
+
+2. REAL DRONE MODE (For Physical Field Deployment)
+- Synthetic generation is deactivated.
+- The web application acts as a Ground Control Station listening via a FastAPI backend framework.
+- Client Device (Raspberry Pi on the drone) pushes data to the server: [Current Drone GPS, Live Detected Livestock Coordinates].
+- Server/Model processes data and responds immediately with: The next 3 to 5 optimized 3D waypoints [Latitude, Longitude, Altitude, Speed].
+
+
+[ROUTING LOGIC - RECEDING HORIZON]
+- STATIC PLANNING IS STRICTLY FORBIDDEN. The path must be dynamic.
+- Control Principle: Receding / Rolling Horizon Control (RHC) loop.
+- Output Per Cycle: Every computation step evaluates the modified live risk matrix and outputs ONLY the next 3 to 5 future waypoints. This ensures instant re-routing if the herd moves or a threat emerges.
+
+
+[USER INTERFACE & VISUALIZATION TARGET]
+- Frontend Framework: Streamlit Dashboard.
+- Input Controls: Side panel sliders for all variables (Camera FPS, camera angles, safe altitude, weather/visibility buffers, battery life).
+- Main Panel: Interactive 2D Map layer combining the pasture polygon, the live Gaussian risk heatmap grid, the moving livestock dots, and the live-updating 3D drone trajectory string.
+
+
+[DEPLOYMENT TARGET]
+- Code and dependency structures must be fully compatible with Streamlit Community Cloud for instant public server deployment via GitHub.
+- Network API endpoints (FastAPI) must remain globally accessible via HTTP requests even when deployed.
+# ==============================================================================
