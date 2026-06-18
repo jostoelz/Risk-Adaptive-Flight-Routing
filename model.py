@@ -779,7 +779,8 @@ def select_focus_cluster(
     hysteresis_m: float = 50.0,
     min_separation_m: float = 45.0,
     gap_factor: float = 2.2,
-) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], bool]:
+) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], bool,
+           Optional[np.ndarray], Optional[Tuple[float, float]]]:
     """
     Pick the herd sub-group the drone should guard, with hysteresis.
 
@@ -794,20 +795,26 @@ def select_focus_cluster(
                            `hysteresis_m` closer to the drone. This hysteresis
                            kills the flip-flop at the midpoint.
 
-    Returns (subset_lonlat, chosen_centroid_lonlat, is_split).
-    When not split it returns (all points, None, False) — the caller clears the
-    lock so a fresh split re-selects by drone proximity. A wolf near the other
-    group is handled separately by the threat field, which can still pull the
-    drone across.
+    Returns (subset_lonlat, chosen_centroid, is_split, guarded_mask, other_centroid):
+      * guarded_mask  -- bool array over the INPUT livestock order: True for the
+                         guarded sub-group (all True when not split). The frontend
+                         uses it to dim the deprioritised animals.
+      * other_centroid-- (lon, lat) of the deprioritised cluster (None when not
+                         split). The frontend uses it to make the heatmap fully
+                         transparent over the deprioritised side.
+    When not split it returns (all points, None, False, all-True mask, None) — the
+    caller clears the lock so a fresh split re-selects by drone proximity. A wolf
+    near the other group is handled separately by the threat field, which can
+    still pull the drone across.
     """
     if livestock_lonlat is None:
-        return None, None, False
+        return None, None, False, None, None
     pts = np.asarray(livestock_lonlat, dtype=float).reshape(-1, 2)
     n = pts.shape[0]
     if n == 0:
-        return pts, None, False
+        return pts, None, False, np.zeros(0, dtype=bool), None
     if n < 4 or drone_lonlat is None:
-        return pts, None, False
+        return pts, None, False, np.ones(n, dtype=bool), None
 
     # Local metric scale (lon/lat -> metres) at the herd's latitude.
     ref_lat = float(np.mean(pts[:, 1]))
@@ -823,12 +830,12 @@ def select_focus_cluster(
     try:
         _, _, vt = np.linalg.svd(X, full_matrices=False)
     except Exception:
-        return pts, None, False
+        return pts, None, False, np.ones(n, dtype=bool), None
     proj = X @ vt[0]
     order = np.argsort(proj)
     gaps = np.diff(proj[order])
     if gaps.size == 0:
-        return pts, None, False
+        return pts, None, False, np.ones(n, dtype=bool), None
     gi = int(np.argmax(gaps))
     max_gap = float(gaps[gi])
     med_gap = float(np.median(gaps))
@@ -836,7 +843,7 @@ def select_focus_cluster(
 
     idx_a, idx_b = order[:gi + 1], order[gi + 1:]
     if idx_a.size < 2 or idx_b.size < 2:
-        return pts, None, False
+        return pts, None, False, np.ones(n, dtype=bool), None
 
     ca = tuple(pts[idx_a].mean(axis=0))
     cb = tuple(pts[idx_b].mean(axis=0))
@@ -844,7 +851,7 @@ def select_focus_cluster(
     # Only treat as a genuine split if the gap is clearly bimodal AND the groups
     # are physically far apart; otherwise it is one blob -> use everything.
     if not (max_gap > gap_factor * med_gap and sep_m > min_separation_m):
-        return pts, None, False
+        return pts, None, False, np.ones(n, dtype=bool), None
 
     da, db = _m(ca, drone_lonlat), _m(cb, drone_lonlat)
 
@@ -857,13 +864,22 @@ def select_focus_cluster(
             cont_idx, cont_c, cont_d = idx_b, cb, db
             alt_idx, alt_c, alt_d = idx_a, ca, da
         if alt_d + hysteresis_m < cont_d:      # other group decisively closer
-            chosen_idx, chosen_c = alt_idx, alt_c
+            chosen_idx, chosen_c, other_c = alt_idx, alt_c, cont_c
         else:
-            chosen_idx, chosen_c = cont_idx, cont_c
+            chosen_idx, chosen_c, other_c = cont_idx, cont_c, alt_c
     else:
-        chosen_idx, chosen_c = (idx_a, ca) if da <= db else (idx_b, cb)
+        if da <= db:
+            chosen_idx, chosen_c, other_c = idx_a, ca, cb
+        else:
+            chosen_idx, chosen_c, other_c = idx_b, cb, ca
 
-    return pts[chosen_idx], (float(chosen_c[0]), float(chosen_c[1])), True
+    guarded_mask = np.zeros(n, dtype=bool)
+    guarded_mask[chosen_idx] = True
+    return (pts[chosen_idx],
+            (float(chosen_c[0]), float(chosen_c[1])),
+            True,
+            guarded_mask,
+            (float(other_c[0]), float(other_c[1])))
 
 
 # ==============================================================================
@@ -1292,6 +1308,11 @@ class RiskModelResult:
     forest_proximity: np.ndarray          # [0,1]; 1.0 within 20 m of forest edge
     forest_distance_m: np.ndarray         # metres to nearest forest edge (inf if none)
     forest_points_lonlat: np.ndarray      # the OSM forest-edge sample points
+    # Split-herd focus context (frontend rendering only; physics unaffected).
+    is_split: bool = False                # herd split into two guarded/other groups
+    herd_guarded_mask: Optional[np.ndarray] = None   # bool over input herd order
+    guarded_centroid: Optional[Tuple[float, float]] = None     # (lon, lat)
+    other_centroid: Optional[Tuple[float, float]] = None       # (lon, lat) deprioritised
 
 
 class RiskModel:
@@ -1338,7 +1359,8 @@ class RiskModel:
         """
         # Split-herd focus: lock onto the nearest sub-group (with hysteresis) so a
         # bimodal KDE saddle never makes the drone jitter between two groups.
-        focus_subset, focus_centroid, _is_split = select_focus_cluster(
+        (focus_subset, focus_centroid, is_split,
+         guarded_mask, other_centroid) = select_focus_cluster(
             livestock_lonlat, drone_lonlat, self._locked_cluster_centroid)
         self._locked_cluster_centroid = focus_centroid
         herd_proximity = compute_herd_proximity(self.grid, focus_subset)
@@ -1366,6 +1388,10 @@ class RiskModel:
             forest_proximity=self.forest_proximity,
             forest_distance_m=self.forest_distance_m,
             forest_points_lonlat=self.features.forest_points_lonlat,
+            is_split=is_split,
+            herd_guarded_mask=guarded_mask,
+            guarded_centroid=focus_centroid,
+            other_centroid=other_centroid,
         )
 
     def sample_threat_location(self, index: int = 0) -> Tuple[float, float]:

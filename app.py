@@ -101,15 +101,29 @@ def build_heatmap_records(
     forest_prox: np.ndarray = None,
     forest_dist: np.ndarray = None,
     elevation_scale: float = 0.0,
+    guarded_centroid=None,
+    other_centroid=None,
 ) -> List[dict]:
     """One filled square polygon per in-polygon cell.
 
-    The display value is max(live risk, static forest proximity) so the deep-red
-    ≤20 m forest band stays unmistakable even when a wolf shifts the live scale.
-    `elevation_scale` > 0 extrudes the cell into a 3D risk surface.
+    `elevation_scale` > 0 extrudes the cell into a 3D risk surface. When a split
+    herd is being guarded (`guarded_centroid` and `other_centroid` both given),
+    cells on the deprioritised side of the perpendicular bisector are rendered
+    fully transparent, so the crimson danger zone only covers the guarded cluster.
     """
     lon_edges, lat_edges = grid.cell_edges()
     ny, nx = grid.shape
+
+    # Local lon scale (for the split bisector distance comparison).
+    lat_mid = float(np.mean(grid.lats))
+    lon_scale = math.cos(math.radians(lat_mid))
+    split_active = guarded_centroid is not None and other_centroid is not None
+
+    def _on_deprioritised_side(clon, clat):
+        dg = ((clon - guarded_centroid[0]) * lon_scale) ** 2 + (clat - guarded_centroid[1]) ** 2
+        do = ((clon - other_centroid[0]) * lon_scale) ** 2 + (clat - other_centroid[1]) ** 2
+        return do < dg
+
     records: List[dict] = []
     for ry in range(ny):
         for rx in range(nx):
@@ -119,6 +133,11 @@ def build_heatmap_records(
             disp = r if forest_prox is None else max(r, float(forest_prox[ry, rx]))
             lon0, lon1 = lon_edges[rx], lon_edges[rx + 1]
             lat0, lat1 = lat_edges[ry], lat_edges[ry + 1]
+            color = risk_to_rgba(disp)
+            if split_active:
+                clon, clat = 0.5 * (lon0 + lon1), 0.5 * (lat0 + lat1)
+                if _on_deprioritised_side(clon, clat):
+                    color = [color[0], color[1], color[2], 0]  # fully transparent
             if forest_dist is not None and np.isfinite(forest_dist[ry, rx]):
                 fm = round(float(forest_dist[ry, rx]), 1)
             else:
@@ -128,7 +147,7 @@ def build_heatmap_records(
                     [lon0, lat0], [lon1, lat0],
                     [lon1, lat1], [lon0, lat1], [lon0, lat0],
                 ],
-                "color": risk_to_rgba(disp),
+                "color": color,
                 "risk": round(r, 3),
                 "forest_m": fm,
                 "elevation": round(disp * elevation_scale, 1),
@@ -774,6 +793,8 @@ heat_records = build_heatmap_records(
     result.grid, result.risk,
     forest_dist=result.forest_distance_m,
     elevation_scale=_ELEV_SCALE,
+    guarded_centroid=(result.guarded_centroid if result.is_split else None),
+    other_centroid=(result.other_centroid if result.is_split else None),
 )
 layers.append(pdk.Layer(
     "PolygonLayer",
@@ -819,22 +840,46 @@ if show_forest and len(result.forest_points_lonlat):
         pickable=False,
     ))
 
-# 3) Livestock dots
+# 3) Livestock dots — guarded cluster bright white; deprioritised cluster dimmed.
 if herd is not None and len(herd):
-    herd_df = pd.DataFrame(herd, columns=["lon", "lat"])
-    layers.append(pdk.Layer(
-        "ScatterplotLayer",
-        data=herd_df,
-        get_position=["lon", "lat"],
-        get_fill_color=[255, 255, 255, 230],
-        get_line_color=[20, 20, 20, 255],
-        line_width_min_pixels=1,
-        stroked=True,
-        get_radius=4,
-        radius_min_pixels=3,
-        radius_max_pixels=8,
-        pickable=False,
-    ))
+    gmask = result.herd_guarded_mask
+    if (result.is_split and gmask is not None and len(gmask) == len(herd)
+            and not np.all(gmask)):
+        guarded_pts = herd[np.asarray(gmask, dtype=bool)]
+        other_pts = herd[~np.asarray(gmask, dtype=bool)]
+        # Deprioritised group first (drawn underneath): muted grey & translucent.
+        if len(other_pts):
+            layers.append(pdk.Layer(
+                "ScatterplotLayer",
+                data=pd.DataFrame(other_pts, columns=["lon", "lat"]),
+                get_position=["lon", "lat"],
+                get_fill_color=[140, 140, 150, 90],
+                get_line_color=[90, 90, 100, 110],
+                line_width_min_pixels=1,
+                stroked=True,
+                get_radius=3,
+                radius_min_pixels=2,
+                radius_max_pixels=6,
+                pickable=False,
+            ))
+        herd_render = guarded_pts
+    else:
+        herd_render = herd
+
+    if len(herd_render):
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=pd.DataFrame(herd_render, columns=["lon", "lat"]),
+            get_position=["lon", "lat"],
+            get_fill_color=[255, 255, 255, 230],
+            get_line_color=[20, 20, 20, 255],
+            line_width_min_pixels=1,
+            stroked=True,
+            get_radius=4,
+            radius_min_pixels=3,
+            radius_max_pixels=8,
+            pickable=False,
+        ))
 
 # 4) Planned waypoint path (drone -> next waypoints), smoothed into an
 #    aerodynamically feasible cubic-spline curve (passes through every waypoint).
@@ -874,15 +919,19 @@ if result.waypoints:
         get_alignment_baseline="'center'",
     ))
 
-# 5) Drone trajectory string (history)
+# 5) Drone trajectory string (history) — smoothed into a flowing B-spline curve.
 if len(trail) >= 2:
+    trail_smooth = smooth_path_lonlat(trail, samples_per_segment=10)
+    trail_path = [[float(x), float(y)] for x, y in trail_smooth]
     layers.append(pdk.Layer(
         "PathLayer",
-        data=[{"path": [list(p) for p in trail]}],
+        data=[{"path": trail_path}],
         get_path="path",
         get_color=[255, 215, 0, 220],
         get_width=2.0,
         width_min_pixels=2,
+        cap_rounded=True,
+        joint_rounded=True,
     ))
 
 # 6) Drone current position
@@ -991,12 +1040,13 @@ with right:
                 f"vertical-align:middle;'></span>")
 
     legend_rows = [
-        (_dot("rgb(255,255,255)", "#222"), "Livestock (IoT GPS)"),
+        (_dot("rgb(255,255,255)", "#222"), "Livestock — guarded group"),
+        (_dot("rgba(140,140,150,0.45)", "#666"), "Livestock — deprioritised (dimmed)"),
         (_dot("rgb(0,120,255)"), "Drone position"),
         (_dot("rgb(220,0,0)"), "Active wolf threat"),
         (_dot("rgb(20,80,30)", "#dfffdf"), "OSM forest edge"),
-        (_line("rgb(255,215,0)"), "Flown trajectory string"),
-        (_line("rgb(0,200,255)"), "Planned next waypoints"),
+        (_line("rgb(255,215,0)"), "Flown path (B-spline)"),
+        (_line("rgb(0,200,255)"), "Planned path (B-spline)"),
     ]
     rows_html = "".join(
         f"<div style='margin:4px 0;font-size:0.9rem;'>{sw}{label}</div>"

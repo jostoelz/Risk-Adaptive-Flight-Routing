@@ -33,7 +33,8 @@
       "PowerShell($env:PORT=\"8013\"; $env:DRONE_STATE_PATH=\"$env:TEMP\\\\drone_v2.json\"; Start-Process -FilePath \"python\" -ArgumentList \"-m\",\"uvicorn\",\"api:app\",\"--host\",\"0.0.0.0\",\"--port\",\"8013\" -RedirectStandardOutput \"_v_out.log\" -RedirectStandardError \"_v_err.log\" -WindowStyle Hidden; $ok=$false; for \\($i=0; $i -lt 30; $i++\\) { try { $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8013/health\" -UseBasicParsing -TimeoutSec 2; if \\($r.StatusCode -eq 200\\) { $ok=$true; break } } catch { Start-Sleep -Milliseconds 700 } }; Write-Output \\(\"API up: \" + $ok\\); python test_live_api.py http://127.0.0.1:8013 2>&1 | Select-Object -Last 7 | Out-String | Write-Output; Write-Output \\(\"loop exit: \" + $LASTEXITCODE\\))",
       "PowerShell(python _bg_mode_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
       "PowerShell(python _track_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
-      "PowerShell(python _split_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))"
+      "PowerShell(python _split_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
+      "PowerShell(python _render_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))"
     ]
   }
 }
