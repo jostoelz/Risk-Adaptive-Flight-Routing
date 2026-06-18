@@ -260,6 +260,7 @@ _TERM_COLORS = {
     "ALERT":     "#f87171",
     "ENVELOPE":  "#a78bfa",
     "LINK":      "#94a3b8",
+    "WAITING":   "#fbbf24",  # amber idle banner -> flips to green on first packet
 }
 
 
@@ -348,6 +349,8 @@ def _reset_simulation() -> None:
     st.session_state.tick = 0
     st.session_state.drone_trail = []
     st.session_state._live_seq = None
+    st.session_state._live_logged = False  # back to the amber WAITING banner
+    st.session_state._test_drone = None    # restart the test-telemetry approach
     scenario = st.session_state.get("scenario", scenarios.SCENARIOS[0])
     if model is not None:
         bbox = _bbox_from_model(model)
@@ -531,6 +534,10 @@ advance_once = st.button(
 # DATA FEED  — synthetic (Simulation) vs live endpoints (Real Drone)
 # ==============================================================================
 
+# Real-Drone clean-slate gate: True until the first live packet arrives. Never
+# blocks SIMULATION mode (always populated synthetically).
+awaiting_live = False
+
 if is_sim:
     # ---- SIMULATION MODE: synthetically generated herd + autonomous drone ----
     do_advance = auto_play or step_clicked or advance_once
@@ -572,12 +579,6 @@ else:
     else:
         # Hosted standalone API (Render/Railway). Nothing to start locally.
         api_status = {"started": False, "hosted": True, "url": api_base}
-    if not st.session_state.get("terminal_log"):
-        where = ("embedded on this server" if use_embedded
-                 else f"hosted at {api_base}")
-        term_log("STARTUP", f"Ground Control online — {where} "
-                            f"(POST /update_herd · GET /next_waypoints)")
-
     # Pull the live shared state (written by POST /update_herd). Prefer an HTTP
     # GET /state against the configured base URL; fall back to the local store.
     live = http_get_json(f"{api_base.rstrip('/')}/state") or rs.load_state()
@@ -603,6 +604,9 @@ else:
         herd = np.empty((0, 2))
         drone = st.session_state.drone
 
+    # Clean-slate gate: until a real packet lands, the UI stays empty/awaiting.
+    awaiting_live = tele is None
+
     result = model.update(
         livestock_lonlat=(herd if len(herd) else None),
         drone_lonlat=drone,
@@ -612,6 +616,11 @@ else:
 
     # ---- Drone Terminal: log the real pipeline events for this cycle ----
     if new_packet and tele:
+        # First live packet flips the terminal from the amber WAITING banner to a
+        # clean, green telemetry log (so the click visibly "comes alive").
+        if not st.session_state.get("_live_logged"):
+            st.session_state.terminal_log = []
+            st.session_state._live_logged = True
         seq = live.get("seq")
         n_ls = len(tele.get("livestock") or [])
         term_log("CONNECTED",
@@ -629,8 +638,11 @@ else:
             term_log("ENVELOPE",
                      f"next leg: alt {w0['altitude_m']:.1f} m · v {w0['speed_ms']:.1f} m/s "
                      f"· cell risk {w0['risk']:.2f}")
-    elif tele is None:
-        term_heartbeat("LINK", "listening on Ground Control — awaiting first RPi packet…")
+    elif awaiting_live:
+        # Clean slate before any button is pressed: a single amber status line.
+        st.session_state.terminal_log = []
+        st.session_state._live_logged = False
+        term_log("WAITING", "Listening for live drone telemetry...")
     else:
         term_heartbeat("LINK",
                        f"link idle — holding last plan (seq {st.session_state.get('_live_seq')})")
@@ -773,7 +785,8 @@ if herd is not None and len(herd):
 
 # 4) Planned waypoint path (drone -> next waypoints), smoothed into an
 #    aerodynamically feasible cubic-spline curve (passes through every waypoint).
-if result.waypoints:
+#    Hidden in Real Drone mode until the first live packet arrives (clean slate).
+if result.waypoints and not awaiting_live:
     raw_path = [[drone[0], drone[1]]] + [[w["lon"], w["lat"]] for w in result.waypoints]
     smooth = smooth_path_lonlat(raw_path, samples_per_segment=16)
     smooth_path = [[float(x), float(y)] for x, y in smooth]
@@ -900,14 +913,28 @@ if not is_sim:
         with cco1:
             if st.button("📨 Push test telemetry (simulate the Pi)",
                          width="stretch"):
-                # Build a plausible packet from the pasture geometry.
+                # Build a plausible packet from the pasture geometry. The herd sits
+                # in the upper-left quadrant; the drone enters from the lower-right.
+                herd_lat = bbox[1] + 0.55 * (bbox[3] - bbox[1])
+                herd_lon = bbox[0] + 0.38 * (bbox[2] - bbox[0])
                 test_ls = [[
-                    bbox[1] + 0.45 * (bbox[3] - bbox[1]) + 0.0001 * (i % 3),
-                    bbox[0] + 0.40 * (bbox[2] - bbox[0]) + 0.0001 * (i // 3),
+                    herd_lat + 0.0001 * (i % 3),
+                    herd_lon + 0.0001 * (i // 3),
                 ] for i in range(8)]
+                # Each push steps the drone 30 % closer to the herd, so the marker
+                # visibly MOVES on the map every click (instead of sitting on the
+                # default spawn point, which was the previous no-op bug).
+                prev = st.session_state.get("_test_drone")
+                if prev is None:
+                    d_lon = bbox[0] + 0.82 * (bbox[2] - bbox[0])
+                    d_lat = bbox[1] + 0.15 * (bbox[3] - bbox[1])
+                else:
+                    d_lon = prev[0] + 0.30 * (herd_lon - prev[0])
+                    d_lat = prev[1] + 0.30 * (herd_lat - prev[1])
+                st.session_state._test_drone = (d_lon, d_lat)
                 packet = {
-                    "drone_lat": bbox[1] + 0.10 * (bbox[3] - bbox[1]),
-                    "drone_lon": 0.5 * (bbox[0] + bbox[2]),
+                    "drone_lat": d_lat,
+                    "drone_lon": d_lon,
                     "drone_alt": 25.0,
                     "livestock": test_ls,
                     "n_waypoints": n_waypoints,
@@ -918,6 +945,8 @@ if not is_sim:
                                f"{resp['count']} waypoints returned).")
                 else:
                     st.error("POST failed — is the API reachable at the base URL?")
+                # Force an immediate rerun so the GET /state below repaints the map,
+                # waypoint table and terminal with the freshly ingested packet.
                 st.rerun()
         with cco2:
             if st.button("🧪 GET /next_waypoints", width="stretch"):
@@ -949,7 +978,10 @@ if not is_sim:
 left, right = st.columns([3, 2])
 with left:
     st.subheader("Next 3–5 waypoints (receding horizon)")
-    if result.waypoints:
+    if awaiting_live:
+        st.info("📡 Awaiting live drone data… "
+                "push test telemetry (or POST to /update_herd) to begin.")
+    elif result.waypoints:
         wp_table = pd.DataFrame(result.waypoints)
         wp_table.index = np.arange(1, len(wp_table) + 1)
         wp_table = wp_table.rename(columns={

@@ -41,7 +41,14 @@
       "PowerShell(python _edge_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
       "PowerShell(python _collision_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
       "PowerShell(python _precession_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
-      "PowerShell(python _hw_test.py 2>&1 | Select-Object | Out-String | Write-Output; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))"
+      "PowerShell(python _hw_test.py 2>&1 | Select-Object | Out-String | Write-Output; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
+      "Bash(ls *test* selftest*)",
+      "Bash(grep -rl \"self-test\\\\|self_test\\\\|selftest\\\\|sweep\" --include=*.py .)",
+      "Bash(python -m py_compile app.py api.py model.py scenarios.py runtime_state.py keep_warm.py test_live_api.py)",
+      "Bash(python -c \"import requests, fastapi, uvicorn; print\\('deps OK'\\)\")",
+      "Bash(python -m uvicorn api:app --host 127.0.0.1 --port 8765 --log-level warning)",
+      "Bash(python -c ' *)",
+      "Bash(python test_live_api.py http://127.0.0.1:8765)"
     ]
   }
 }
