@@ -383,6 +383,10 @@ class StaticFeatures:
 
     points_lonlat: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))
     source: str = "none"
+    # Forest-edge points are tracked separately so the dashboard can colour the
+    # deep-red "within-20-m-of-forest" danger band precisely.
+    forest_points_lonlat: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2)))
 
     def __len__(self) -> int:
         return int(self.points_lonlat.shape[0])
@@ -440,7 +444,8 @@ def _fetch_features_osmnx(ring: np.ndarray) -> Optional[StaticFeatures]:
 
     poly = ShapelyPolygon([(lon, lat) for lon, lat in ring])
     collected: List[Tuple[float, float]] = []
-    for _name, tags in _OSM_FEATURE_TAGS.items():
+    forest: List[Tuple[float, float]] = []
+    for name, tags in _OSM_FEATURE_TAGS.items():
         try:
             # osmnx >=1.0 exposes features_from_polygon; older uses geometries_*.
             fetch = getattr(ox, "features_from_polygon", None) or \
@@ -452,13 +457,21 @@ def _fetch_features_osmnx(ring: np.ndarray) -> Optional[StaticFeatures]:
                 gdf = fetch(poly, tags)
             if gdf is None or len(gdf) == 0:
                 continue
+            pts_this: List[Tuple[float, float]] = []
             for geom in gdf.geometry:
-                collected.extend(_sample_geometry_points(geom))
+                pts_this.extend(_sample_geometry_points(geom))
+            collected.extend(pts_this)
+            if name == "forest":
+                forest.extend(pts_this)
         except Exception:
             continue
     if not collected:
         return None
-    return StaticFeatures(np.asarray(collected, dtype=float), source="osmnx")
+    return StaticFeatures(
+        np.asarray(collected, dtype=float), source="osmnx",
+        forest_points_lonlat=(np.asarray(forest, dtype=float)
+                              if forest else np.empty((0, 2))),
+    )
 
 
 def _fetch_features_overpy(ring: np.ndarray) -> Optional[StaticFeatures]:
@@ -484,15 +497,25 @@ def _fetch_features_overpy(ring: np.ndarray) -> Optional[StaticFeatures]:
     except Exception:
         return None
     collected: List[Tuple[float, float]] = []
+    forest: List[Tuple[float, float]] = []
     for way in getattr(result, "ways", []):
+        pts_this: List[Tuple[float, float]] = []
         for node in way.get_nodes(resolve_missing=False) or []:
             try:
-                collected.append((float(node.lon), float(node.lat)))
+                pts_this.append((float(node.lon), float(node.lat)))
             except Exception:
                 continue
+        collected.extend(pts_this)
+        tags = getattr(way, "tags", {}) or {}
+        if tags.get("natural") == "wood" or tags.get("landuse") == "forest":
+            forest.extend(pts_this)
     if not collected:
         return None
-    return StaticFeatures(np.asarray(collected, dtype=float), source="overpy")
+    return StaticFeatures(
+        np.asarray(collected, dtype=float), source="overpy",
+        forest_points_lonlat=(np.asarray(forest, dtype=float)
+                              if forest else np.empty((0, 2))),
+    )
 
 
 def _synthetic_features(grid: Grid) -> StaticFeatures:
@@ -516,7 +539,8 @@ def _synthetic_features(grid: Grid) -> StaticFeatures:
         np.concatenate([forest_lon, creek_lon]),
         np.concatenate([forest_lat, creek_lat]),
     ])
-    return StaticFeatures(pts, source="synthetic")
+    forest_pts = np.column_stack([forest_lon, forest_lat])
+    return StaticFeatures(pts, source="synthetic", forest_points_lonlat=forest_pts)
 
 
 # ==============================================================================
@@ -583,6 +607,45 @@ def compute_baseline_risk(grid: Grid, features: StaticFeatures) -> np.ndarray:
     baseline = mean.reshape(ny, nx)
     baseline = np.clip(baseline, 0.0, 1.0)
     return baseline
+
+
+def compute_forest_proximity(
+    grid: Grid,
+    forest_points_lonlat: np.ndarray,
+    red_radius_m: float = 20.0,
+    fade_m: float = 50.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Per-cell proximity to the nearest OpenStreetMap forest edge.
+
+    Returns (proximity, distance_m), both shaped (ny, nx):
+      * distance_m  -- straight-line metres from each cell centre to the closest
+                       forest-edge sample point (np.inf if no forest present).
+      * proximity   -- in [0, 1]: exactly 1.0 within `red_radius_m` (the deep-red
+                       danger band), then a SMOOTH exponential decay toward 0 over
+                       `fade_m` metres as cells move toward the open centre.
+
+    This is the geometric basis for the map's red→yellow→green colouring and is
+    folded into the planning baseline so the drone is drawn to forest edges.
+    """
+    ny, nx = grid.shape
+    if forest_points_lonlat is None or len(forest_points_lonlat) == 0:
+        return (np.zeros((ny, nx), dtype=float),
+                np.full((ny, nx), np.inf, dtype=float))
+
+    fx, fy = grid.lonlat_to_xy(
+        forest_points_lonlat[:, 0], forest_points_lonlat[:, 1])
+    tree = cKDTree(np.column_stack([fx, fy]))
+
+    GX, GY = grid.mesh_xy()
+    query = np.column_stack([GX.ravel(), GY.ravel()])
+    dist, _ = tree.query(query, k=1)
+    dist = dist.reshape(ny, nx)
+
+    over = np.maximum(0.0, dist - float(red_radius_m))
+    proximity = np.exp(-over / max(float(fade_m), 1e-6))
+    proximity[dist <= red_radius_m] = 1.0
+    return np.clip(proximity, 0.0, 1.0), dist
 
 
 # ==============================================================================
@@ -957,6 +1020,9 @@ class RiskModelResult:
     feature_source: str
     h_min_m: float
     h_max_m: float
+    forest_proximity: np.ndarray          # [0,1]; 1.0 within 20 m of forest edge
+    forest_distance_m: np.ndarray         # metres to nearest forest edge (inf if none)
+    forest_points_lonlat: np.ndarray      # the OSM forest-edge sample points
 
 
 class RiskModel:
@@ -977,7 +1043,15 @@ class RiskModel:
         self.grid = build_grid(polygon, cell_size_m=cell_size_m)
         # Static layers are fetched once (they do not change between cycles).
         self.features = fetch_static_features(self.grid)
-        self.baseline = compute_baseline_risk(self.grid, self.features)
+        self.baseline_gpr = compute_baseline_risk(self.grid, self.features)
+        # Geometric forest-edge proximity: 1.0 within 20 m (the deep-red band),
+        # smoothly fading toward the open centre.
+        self.forest_proximity, self.forest_distance_m = compute_forest_proximity(
+            self.grid, self.features.forest_points_lonlat)
+        # The forest band anchors the high end of the static baseline so the
+        # planner is genuinely drawn to forest edges and the map reads true.
+        self.baseline = np.clip(
+            np.maximum(self.baseline_gpr, self.forest_proximity), 0.0, 1.0)
 
     def update(
         self,
@@ -1012,6 +1086,9 @@ class RiskModel:
             feature_source=self.features.source,
             h_min_m=env["h_min_m"],
             h_max_m=env["h_max_m"],
+            forest_proximity=self.forest_proximity,
+            forest_distance_m=self.forest_distance_m,
+            forest_points_lonlat=self.features.forest_points_lonlat,
         )
 
     def sample_threat_location(self, index: int = 0) -> Tuple[float, float]:

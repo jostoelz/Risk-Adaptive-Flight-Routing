@@ -26,6 +26,7 @@ Run with:   streamlit run app.py
 
 from __future__ import annotations
 
+import html
 import json
 import math
 import os
@@ -65,18 +66,48 @@ def _m_per_deg_lon(lat_deg: float) -> float:
     return _M_PER_DEG_LAT * math.cos(math.radians(lat_deg))
 
 
-def risk_to_rgba(r: float) -> List[int]:
-    """Map a risk value in [0,1] to a green→yellow→red semi-transparent colour."""
-    r = float(np.clip(r, 0.0, 1.0))
-    red = int(255 * min(1.0, r * 2.0))
-    green = int(255 * min(1.0, (1.0 - r) * 2.0))
-    blue = 40
-    alpha = int(35 + 175 * r)  # higher risk = more opaque
-    return [red, green, blue, alpha]
+# Perceptual green→yellow→orange→red ramp. Stop 1.0 == deep red == within 20 m
+# of an OpenStreetMap forest edge; 0.0 == safe open centre.
+_RISK_STOPS: List[Tuple[float, Tuple[int, int, int]]] = [
+    (0.00, (26, 152, 80)),    # deep green  (safe centre)
+    (0.30, (145, 207, 96)),   # light green
+    (0.50, (254, 224, 90)),   # yellow
+    (0.70, (253, 141, 60)),   # orange
+    (0.85, (227, 74, 51)),    # red
+    (1.00, (165, 15, 21)),    # deep crimson (≤20 m to forest edge)
+]
+# CSS gradient string for the HTML legend bar (kept in sync with _RISK_STOPS).
+RISK_GRADIENT_CSS = ", ".join(
+    f"rgb{c} {int(v * 100)}%" for v, c in _RISK_STOPS)
 
 
-def build_heatmap_records(grid, risk: np.ndarray) -> List[dict]:
-    """One filled square polygon per in-polygon cell, coloured by risk."""
+def risk_to_rgba(value: float, base_alpha: int = 70, max_alpha: int = 225
+                 ) -> List[int]:
+    """Map a value in [0,1] to a smooth RGBA along the perceptual risk ramp."""
+    v = float(np.clip(value, 0.0, 1.0))
+    rgb = list(_RISK_STOPS[-1][1])
+    for (v0, c0), (v1, c1) in zip(_RISK_STOPS, _RISK_STOPS[1:]):
+        if v <= v1:
+            t = (v - v0) / (v1 - v0) if v1 > v0 else 0.0
+            rgb = [int(round(c0[k] + t * (c1[k] - c0[k]))) for k in range(3)]
+            break
+    alpha = int(base_alpha + (max_alpha - base_alpha) * (v ** 0.85))
+    return rgb + [alpha]
+
+
+def build_heatmap_records(
+    grid,
+    risk: np.ndarray,
+    forest_prox: np.ndarray = None,
+    forest_dist: np.ndarray = None,
+    elevation_scale: float = 0.0,
+) -> List[dict]:
+    """One filled square polygon per in-polygon cell.
+
+    The display value is max(live risk, static forest proximity) so the deep-red
+    ≤20 m forest band stays unmistakable even when a wolf shifts the live scale.
+    `elevation_scale` > 0 extrudes the cell into a 3D risk surface.
+    """
     lon_edges, lat_edges = grid.cell_edges()
     ny, nx = grid.shape
     records: List[dict] = []
@@ -85,15 +116,22 @@ def build_heatmap_records(grid, risk: np.ndarray) -> List[dict]:
             if not grid.mask[ry, rx]:
                 continue
             r = float(risk[ry, rx])
+            disp = r if forest_prox is None else max(r, float(forest_prox[ry, rx]))
             lon0, lon1 = lon_edges[rx], lon_edges[rx + 1]
             lat0, lat1 = lat_edges[ry], lat_edges[ry + 1]
+            if forest_dist is not None and np.isfinite(forest_dist[ry, rx]):
+                fm = round(float(forest_dist[ry, rx]), 1)
+            else:
+                fm = None
             records.append({
                 "polygon": [
                     [lon0, lat0], [lon1, lat0],
                     [lon1, lat1], [lon0, lat1], [lon0, lat0],
                 ],
-                "color": risk_to_rgba(r),
+                "color": risk_to_rgba(disp),
                 "risk": round(r, 3),
+                "forest_m": fm,
+                "elevation": round(disp * elevation_scale, 1),
             })
     return records
 
@@ -209,6 +247,73 @@ def http_post_json(url: str, payload: dict, timeout: float = 3.0) -> Optional[di
         return None
 
 
+# ------------------------------------------------------------------------------
+# Drone Terminal — live Ground Control log
+# ------------------------------------------------------------------------------
+_TERM_COLORS = {
+    "STARTUP":   "#4ade80",
+    "CONNECTED": "#4ade80",
+    "COMPUTING": "#38bdf8",
+    "SENT":      "#facc15",
+    "ALERT":     "#f87171",
+    "ENVELOPE":  "#a78bfa",
+    "LINK":      "#94a3b8",
+}
+
+
+def term_log(level: str, msg: str) -> None:
+    """Append a timestamped line to the drone terminal buffer (capped)."""
+    log = st.session_state.setdefault("terminal_log", [])
+    log.append({"t": time.strftime("%H:%M:%S"), "level": level, "msg": msg})
+    del log[:-400]  # keep the most recent 400 lines
+
+
+def term_heartbeat(level: str, msg: str) -> None:
+    """Like term_log, but if the last line is identical, just refresh its time
+    (so idle polling shows one living heartbeat instead of flooding the log)."""
+    log = st.session_state.setdefault("terminal_log", [])
+    entry = {"t": time.strftime("%H:%M:%S"), "level": level, "msg": msg}
+    if log and log[-1]["level"] == level and log[-1]["msg"] == msg:
+        log[-1] = entry
+    else:
+        log.append(entry)
+        del log[:-400]
+
+
+def render_drone_terminal() -> None:
+    """Render the terminal-style live log component at the bottom of the page."""
+    log = st.session_state.get("terminal_log", [])
+    rows = ""
+    for e in log[-13:]:
+        color = _TERM_COLORS.get(e["level"], "#cbd5e1")
+        rows += (
+            f"<div style='white-space:pre-wrap;'>"
+            f"<span style='color:#475569;'>[{e['t']}]</span> "
+            f"<span style='color:{color};font-weight:700;'>[{e['level']}]</span> "
+            f"<span style='color:#e2e8f0;'>{html.escape(e['msg'])}</span></div>"
+        )
+    rows += "<div style='color:#4ade80;'>&gt; <span style='animation:blink 1s steps(1) infinite;'>▌</span></div>"
+
+    st.markdown(
+        f"""
+        <style>@keyframes blink {{ 50% {{ opacity: 0; }} }}</style>
+        <div style="background:#0b0f14;border:1px solid #1f2933;border-radius:10px;
+                    box-shadow:0 0 0 1px #00000030, inset 0 0 24px #00000040;
+                    overflow:hidden;margin-top:4px;">
+          <div style="background:#11161d;padding:7px 13px;border-bottom:1px solid #1f2933;
+                      font-family:monospace;font-size:0.8rem;color:#94a3b8;">
+            <span style="color:#22c55e;">●</span> DRONE TERMINAL — Ground Control Station
+            &nbsp;·&nbsp; <span style="color:#64748b;">live RHC telemetry</span>
+          </div>
+          <div style="height:248px;overflow-y:auto;padding:11px 14px;
+                      font-family:'Cascadia Code','Consolas',monospace;
+                      font-size:0.82rem;line-height:1.55;">{rows}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ==============================================================================
 # Session-state bootstrap
 # ==============================================================================
@@ -300,6 +405,12 @@ auto_play = st.sidebar.toggle(
 refresh_s = st.sidebar.slider("Refresh interval (s)", 0.2, 3.0, 0.7, 0.1)
 cell_size_m = st.sidebar.slider("Grid cell size (m)", 10.0, 50.0, 20.0, 5.0)
 
+st.sidebar.markdown("### 🗺️ Map")
+show_3d = st.sidebar.toggle("3D risk surface (extrude cells)", value=False,
+                            help="Raise high-risk cells into a 3D heat surface.")
+show_forest = st.sidebar.toggle("Show OSM forest edge", value=True,
+                                help="Overlay the actual forest-edge points.")
+
 st.session_state.n_animals = n_animals
 
 c1, c2 = st.sidebar.columns(2)
@@ -333,6 +444,7 @@ if "herd" not in st.session_state or st.session_state.herd.shape[0] != n_animals
 if reset_clicked:
     _reset_simulation()
     st.session_state._live_seq = None
+    st.session_state.terminal_log = []
     if not is_sim:
         rs.reset()  # clear the live telemetry feed too
 
@@ -423,11 +535,16 @@ else:
     # ---- REAL DRONE MODE: feed comes from the FastAPI endpoints ----
     # Start the embedded Ground Control server once (one-click deployment).
     api_status = ensure_embedded_api(api_host, int(api_port))
+    if not st.session_state.get("terminal_log"):
+        term_log("STARTUP", f"Ground Control online — FastAPI endpoints live on "
+                            f"{api_host}:{int(api_port)} (POST /update_herd · "
+                            f"GET /next_waypoints)")
 
     # Pull the live shared state (written by POST /update_herd). Prefer an HTTP
     # GET /state against the configured base URL; fall back to the local store.
     live = http_get_json(f"{api_base.rstrip('/')}/state") or rs.load_state()
     tele = live.get("telemetry")
+    new_packet = False
 
     if tele:
         ls = tele.get("livestock") or []
@@ -440,6 +557,7 @@ else:
         # Append to the flown trajectory only when a NEW packet arrived.
         last_seq = st.session_state.get("_live_seq")
         if live.get("seq") != last_seq:
+            new_packet = True
             st.session_state._live_seq = live.get("seq")
             st.session_state.tick = int(live.get("seq") or 0)
             st.session_state.drone_trail.append([drone[0], drone[1]])
@@ -457,6 +575,34 @@ else:
         threats_lonlat=threats_arr,
         n_waypoints=n_waypoints,
     )
+
+    # ---- Drone Terminal: log the real pipeline events for this cycle ----
+    if new_packet and tele:
+        seq = live.get("seq")
+        n_ls = len(tele.get("livestock") or [])
+        peak = float(result.risk[result.grid.mask].max()) if result.grid.mask.any() else 0.0
+        term_log("CONNECTED",
+                 f"RPi telemetry received — drone @ {drone[1]:.5f}, {drone[0]:.5f} "
+                 f"· {n_ls} livestock tracked (seq {seq})")
+        if threats:
+            term_log("ALERT",
+                     f"Wolf signature detected near forest edge — risk matrix "
+                     f"recalibrated (peak risk {peak:.2f})")
+        term_log("COMPUTING",
+                 "3D waypoints generated via RHC (MDP value-iteration + 2-opt MTSP)")
+        k = len(result.waypoints)
+        term_log("SENT",
+                 f"{k} waypoints pushed to flight controller [Lat, Lon, Alt, Speed]")
+        if result.waypoints:
+            w0 = result.waypoints[0]
+            term_log("ENVELOPE",
+                     f"next leg: alt {w0['altitude_m']:.1f} m · v {w0['speed_ms']:.1f} m/s "
+                     f"· cell risk {w0['risk']:.2f}")
+    elif tele is None:
+        term_heartbeat("LINK", "listening on Ground Control — awaiting first RPi packet…")
+    else:
+        term_heartbeat("LINK",
+                       f"link idle — holding last plan (seq {st.session_state.get('_live_seq')})")
 
 trail = st.session_state.drone_trail
 
@@ -545,13 +691,23 @@ if not is_sim:
 
 layers = []
 
-# 1) Risk heatmap (semi-transparent coloured blocks)
-heat_records = build_heatmap_records(result.grid, result.risk)
+# 1) Risk heatmap — coloured by max(live risk, forest proximity). Deep crimson
+#    = within 20 m of an OSM forest edge; smooth green/yellow toward the centre.
+_ELEV_SCALE = 90.0 if show_3d else 0.0
+heat_records = build_heatmap_records(
+    result.grid, result.risk,
+    forest_prox=result.forest_proximity,
+    forest_dist=result.forest_distance_m,
+    elevation_scale=_ELEV_SCALE,
+)
 layers.append(pdk.Layer(
     "PolygonLayer",
     data=heat_records,
     get_polygon="polygon",
     get_fill_color="color",
+    get_elevation="elevation",
+    extruded=bool(show_3d),
+    elevation_scale=1,
     stroked=False,
     filled=True,
     pickable=True,
@@ -570,6 +726,23 @@ layers.append(pdk.Layer(
     stroked=True,
     filled=True,
 ))
+
+# 2b) Actual OSM forest-edge points (what makes the red band red)
+if show_forest and len(result.forest_points_lonlat):
+    forest_df = pd.DataFrame(result.forest_points_lonlat, columns=["lon", "lat"])
+    layers.append(pdk.Layer(
+        "ScatterplotLayer",
+        data=forest_df,
+        get_position=["lon", "lat"],
+        get_fill_color=[20, 80, 30, 220],
+        get_line_color=[230, 255, 230, 180],
+        line_width_min_pixels=1,
+        stroked=True,
+        get_radius=2.5,
+        radius_min_pixels=2,
+        radius_max_pixels=5,
+        pickable=False,
+    ))
 
 # 3) Livestock dots
 if herd is not None and len(herd):
@@ -666,7 +839,7 @@ view_state = pdk.ViewState(
     longitude=0.5 * (bbox[0] + bbox[2]),
     latitude=0.5 * (bbox[1] + bbox[3]),
     zoom=15.5,
-    pitch=35,
+    pitch=45 if show_3d else 35,
     bearing=0,
 )
 
@@ -674,9 +847,30 @@ deck = pdk.Deck(
     layers=layers,
     initial_view_state=view_state,
     map_style="road",
-    tooltip={"text": "risk: {risk}\nalt: {altitude_m} m\nv: {speed_ms} m/s"},
+    tooltip={"html": "<b>Risk:</b> {risk}<br/>"
+                     "<b>Dist. to forest:</b> {forest_m} m<br/>"
+                     "<b>Alt:</b> {altitude_m} m &nbsp; <b>v:</b> {speed_ms} m/s",
+             "style": {"backgroundColor": "rgba(20,20,20,0.85)",
+                       "color": "white", "fontSize": "12px"}},
 )
 st.pydeck_chart(deck, use_container_width=True)
+
+# --- Horizontal colour-scale legend directly beneath the map (instant read) ---
+st.markdown(
+    f"""
+    <div style="margin:-6px 0 10px 0;">
+      <div style="height:16px;border-radius:8px;border:1px solid #ffffff33;
+                  background:linear-gradient(90deg, {RISK_GRADIENT_CSS});"></div>
+      <div style="display:flex;justify-content:space-between;
+                  font-size:0.78rem;color:#cfcfcf;margin-top:3px;">
+        <span>🟢 Safe — open centre</span>
+        <span>🟡 Elevated</span>
+        <span>🔴 High — ≤ 20 m from forest edge</span>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ==============================================================================
@@ -705,20 +899,48 @@ with left:
 
 with right:
     st.subheader("Legend")
+
+    def _dot(rgb: str, ring: str = "#00000055") -> str:
+        return (f"<span style='display:inline-block;width:12px;height:12px;"
+                f"border-radius:50%;background:{rgb};border:1px solid {ring};"
+                f"margin-right:7px;vertical-align:middle;'></span>")
+
+    def _line(rgb: str) -> str:
+        return (f"<span style='display:inline-block;width:18px;height:4px;"
+                f"border-radius:2px;background:{rgb};margin-right:7px;"
+                f"vertical-align:middle;'></span>")
+
+    legend_rows = [
+        (_dot("rgb(255,255,255)", "#222"), "Livestock (IoT GPS)"),
+        (_dot("rgb(0,120,255)"), "Drone position"),
+        (_dot("rgb(220,0,0)"), "Active wolf threat"),
+        (_dot("rgb(20,80,30)", "#dfffdf"), "OSM forest edge"),
+        (_line("rgb(255,215,0)"), "Flown trajectory string"),
+        (_line("rgb(0,200,255)"), "Planned next waypoints"),
+    ]
+    rows_html = "".join(
+        f"<div style='margin:4px 0;font-size:0.9rem;'>{sw}{label}</div>"
+        for sw, label in legend_rows
+    )
     st.markdown(
-        """
-        - 🟥 **Red blocks** — high wolf-intrusion risk
-        - 🟩 **Green blocks** — low risk (semi-transparent grid)
-        - ⚪ **White dots** — livestock (IoT GPS)
-        - 🔵 **Blue dot** — drone position
-        - 🟡 **Gold line** — flown trajectory string
-        - 🔵 **Cyan line** — planned next waypoints
-        - 🔴 **Red dot** — active wolf threat
-        """
+        f"""
+        <div style="font-size:0.85rem;color:#cfcfcf;margin-bottom:6px;">
+          <b>Risk grid</b> — cell colour = wolf-intrusion risk:
+        </div>
+        <div style="height:14px;border-radius:7px;border:1px solid #ffffff33;
+                    background:linear-gradient(90deg, {RISK_GRADIENT_CSS});"></div>
+        <div style="display:flex;justify-content:space-between;font-size:0.72rem;
+                    color:#bbb;margin:2px 0 10px 0;">
+          <span>safe</span><span>≤ 20 m to forest</span>
+        </div>
+        {rows_html}
+        """,
+        unsafe_allow_html=True,
     )
     st.caption(
         f"Static features source: **{result.feature_source}** · "
         f"grid {result.grid.shape[0]}×{result.grid.shape[1]} · "
+        f"forest pts {len(result.forest_points_lonlat)} · "
         f"overlap eff. {hw.overlap_fraction*100:.0f}%"
     )
 
@@ -736,6 +958,15 @@ with st.expander("ℹ️ How the pipeline reacts to your controls"):
           threat on the very next cycle.
         """
     )
+
+
+# ==============================================================================
+# DRONE TERMINAL  (Real Drone Mode only)
+# ==============================================================================
+
+if not is_sim:
+    st.markdown("")  # spacer
+    render_drone_terminal()
 
 
 # ==============================================================================
