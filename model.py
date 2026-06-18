@@ -192,19 +192,28 @@ class HardwareConstraints:
         """
         Highest altitude at which a wolf still spans MIN_DETECTION_SIZE_WOLF_PX.
 
-        Ground Sample Distance (vertical):
-            footprint_v(h) = 2 * h * tan(FoV_v / 2)        [m on the ground]
-            metres_per_pixel(h) = footprint_v(h) / res_h
-        Detection requires:
-            wolf_size_m / metres_per_pixel(h) >= min_px
-        Solving for h:
-            h_max = wolf_size_m * res_h / (min_px * 2 * tan(FoV_v / 2))
+        Ground Sample Distance per axis:
+            footprint(h) = 2 * h * tan(FoV / 2)            [m on the ground]
+            metres_per_pixel(h) = footprint(h) / resolution
+        Detection requires wolf_size_m / metres_per_pixel(h) >= min_px on the
+        LIMITING (coarser) axis, so we take the lower of the two per-axis altitude
+        limits. This makes BOTH the horizontal and vertical camera FoV (and the
+        min-detection-pixel requirement) scale the max safe altitude in real time:
+            h_max_axis = wolf_size_m * res_axis / (min_px * 2 * tan(FoV_axis / 2))
+            h_max      = min(h_max_horizontal, h_max_vertical)
         """
-        half_fov_v = math.radians(self.camera_fov_v_deg / 2.0)
-        denom = self.min_detection_size_wolf_px * 2.0 * math.tan(half_fov_v)
-        if denom <= 0:
+        min_px = self.min_detection_size_wolf_px
+        if min_px <= 0:
             return self.min_safety_altitude_m
-        h_max = self.wolf_size_m * self.camera_res_h_px / denom
+
+        def _axis_limit(fov_deg: float, res_px: int) -> float:
+            denom = min_px * 2.0 * math.tan(math.radians(fov_deg / 2.0))
+            return float("inf") if denom <= 0 else self.wolf_size_m * res_px / denom
+
+        h_max = min(
+            _axis_limit(self.camera_fov_h_deg, self.camera_res_w_px),
+            _axis_limit(self.camera_fov_v_deg, self.camera_res_h_px),
+        )
         # Never below the obstacle-clearance floor.
         return max(h_max, self.min_safety_altitude_m)
 

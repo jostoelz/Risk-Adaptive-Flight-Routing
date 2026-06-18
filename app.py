@@ -383,12 +383,21 @@ mode = st.sidebar.radio(
 is_sim = mode == "SIMULATION MODE"
 
 st.sidebar.markdown("### 🎥 Camera & Edge AI")
-fov_h = st.sidebar.slider("Camera FoV — horizontal (°)", 30.0, 120.0, 75.0, 1.0)
-fov_v = st.sidebar.slider("Camera FoV — vertical (°)", 20.0, 100.0, 50.0, 1.0)
-fps = st.sidebar.slider("Edge inference rate (FPS)", 0.25, 10.0, 1.12, 0.01,
-                        help="Raspberry-Pi object-detection throughput limit.")
-min_wolf_px = st.sidebar.slider("Min wolf size on sensor (px)", 10, 120, 40, 1,
-                                help="Drives the maximum detection altitude.")
+min_wolf_px = st.sidebar.slider(
+    "Wolf min detection size (px)", 20, 100, 40, 1,
+    help="MIN_DETECTION_SIZE_WOLF_PX — minimum pixels a wolf must span to be "
+         "detected. Directly sets the maximum safe flight altitude (more pixels "
+         "required ⇒ fly lower).")
+fov_h = st.sidebar.slider(
+    "Camera FoV — horizontal (°)", 50.0, 120.0, 75.0, 1.0,
+    help="CAMERA_FOV_HORIZONTAL_DEG — wider FoV coarsens the ground sampling, "
+         "lowering the max detection altitude (tighter safety margin).")
+fps = st.sidebar.slider(
+    "Pi inference rate (FPS)", 0.5, 5.0, 1.12, 0.01,
+    help="RASPBERRY_PI_INFERENCE_RATE_FPS — edge-AI throughput limit; caps the "
+         "gap-free coverage velocity per cell.")
+fov_v = st.sidebar.slider("Camera FoV — vertical (°)", 20.0, 100.0, 50.0, 1.0,
+                          help="Vertical FoV — also feeds the GSD / altitude limit.")
 
 st.sidebar.markdown("### 🚁 Flight Envelope")
 min_alt = st.sidebar.slider("Safe minimum altitude (m)", 3.0, 40.0, 8.0, 0.5)
@@ -654,68 +663,10 @@ m3.metric("Min safe alt.", f"{result.h_min_m:.1f} m")
 m4.metric("Livestock tracked", f"{n_livestock}")
 m5.metric("Cycle / tick", f"{st.session_state.tick}")
 
-if not is_sim:
-    healthy = http_get_json(f"{api_base.rstrip('/')}/health") is not None
-    badge = "🟢 reachable" if healthy else "🟠 starting / unreachable"
-    where = "embedded (this server)" if use_embedded else f"hosted · `{api_base}`"
-    extra = ("" if healthy or use_embedded else
-             " — a free hosted API may be cold-starting; retry in ~30 s.")
-    st.info(
-        f"**REAL DRONE MODE** — synthetic generation is **OFF**. Ground Control "
-        f"API: {where} ({badge}).{extra} The Raspberry Pi pushes "
-        f"`[drone GPS, livestock]` to **POST {api_base}/update_herd** and the "
-        f"flight controller pulls **GET {api_base}/next_waypoints**."
-    )
-
-    with st.expander("📡 Endpoint console (live)", expanded=(tele is None)):
-        st.markdown(
-            f"**POST** `{api_base}/update_herd` — push telemetry  \n"
-            f"**GET** `{api_base}/next_waypoints` — 3–5 × `[Lat, Lon, Alt, Speed]`"
-        )
-        cco1, cco2 = st.columns(2)
-        with cco1:
-            if st.button("📨 Push test telemetry (simulate the Pi)",
-                         width="stretch"):
-                # Build a plausible packet from the pasture geometry.
-                test_ls = [[
-                    bbox[1] + 0.45 * (bbox[3] - bbox[1]) + 0.0001 * (i % 3),
-                    bbox[0] + 0.40 * (bbox[2] - bbox[0]) + 0.0001 * (i // 3),
-                ] for i in range(8)]
-                packet = {
-                    "drone_lat": bbox[1] + 0.10 * (bbox[3] - bbox[1]),
-                    "drone_lon": 0.5 * (bbox[0] + bbox[2]),
-                    "drone_alt": 25.0,
-                    "livestock": test_ls,
-                    "n_waypoints": n_waypoints,
-                }
-                resp = http_post_json(f"{api_base.rstrip('/')}/update_herd", packet)
-                if resp:
-                    st.success(f"Telemetry ingested (seq {resp['seq']}, "
-                               f"{resp['count']} waypoints returned).")
-                else:
-                    st.error("POST failed — is the API reachable at the base URL?")
-                st.rerun()
-        with cco2:
-            if st.button("🧪 GET /next_waypoints", width="stretch"):
-                st.session_state._endpoint_probe = http_get_json(
-                    f"{api_base.rstrip('/')}/next_waypoints")
-
-        probe = st.session_state.get("_endpoint_probe")
-        if probe is not None:
-            st.caption("Latest GET /next_waypoints response (served to the drone):")
-            st.json(probe)
-
-    if tele is None:
-        st.warning("Waiting for the first telemetry packet. Use **Push test "
-                   "telemetry** above, or POST to the endpoint, e.g.:")
-        st.code(
-            f"curl -X POST {api_base}/update_herd -H 'Content-Type: application/json' "
-            f"-d '{{\"drone_lat\": {0.5*(bbox[1]+bbox[3]):.5f}, "
-            f"\"drone_lon\": {0.5*(bbox[0]+bbox[2]):.5f}, "
-            f"\"livestock\": [[{0.5*(bbox[1]+bbox[3]):.5f}, "
-            f"{0.5*(bbox[0]+bbox[2]):.5f}]], \"n_waypoints\": 4}}'",
-            language="bash",
-        )
+# NOTE: the REAL DRONE control panel (API status, endpoint console, test
+# telemetry) is rendered BELOW the map (see render_real_drone_panel) so the map
+# always sits at the same tree position in both modes — this is what prevents the
+# duplicate/ghost map when switching Simulation <-> Real Drone.
 
 
 # ==============================================================================
@@ -905,7 +856,9 @@ deck = pdk.Deck(
              "style": {"backgroundColor": "rgba(20,20,20,0.85)",
                        "color": "white", "fontSize": "12px"}},
 )
-st.pydeck_chart(deck, use_container_width=True)
+# Exactly ONE map: a stable key gives the deck a persistent identity so switching
+# modes reconciles the same canvas instead of leaving a duplicate/ghost.
+st.pydeck_chart(deck, use_container_width=True, key="risk_map")
 
 # --- Horizontal colour-scale legend directly beneath the map (instant read) ---
 st.markdown(
@@ -923,6 +876,70 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# --- REAL DRONE control panel (rendered AFTER the map; keeps map position fixed) ---
+if not is_sim:
+    healthy = http_get_json(f"{api_base.rstrip('/')}/health") is not None
+    badge = "🟢 reachable" if healthy else "🟠 starting / unreachable"
+    where = "embedded (this server)" if use_embedded else f"hosted · `{api_base}`"
+    extra = ("" if healthy or use_embedded else
+             " — a free hosted API may be cold-starting; retry in ~30 s.")
+    st.info(
+        f"**REAL DRONE MODE** — synthetic generation is **OFF**. Ground Control "
+        f"API: {where} ({badge}).{extra} The Raspberry Pi pushes "
+        f"`[drone GPS, livestock]` to **POST {api_base}/update_herd** and the "
+        f"flight controller pulls **GET {api_base}/next_waypoints**."
+    )
+
+    with st.expander("📡 Endpoint console (live)", expanded=(tele is None)):
+        st.markdown(
+            f"**POST** `{api_base}/update_herd` — push telemetry  \n"
+            f"**GET** `{api_base}/next_waypoints` — 3–5 × `[Lat, Lon, Alt, Speed]`"
+        )
+        cco1, cco2 = st.columns(2)
+        with cco1:
+            if st.button("📨 Push test telemetry (simulate the Pi)",
+                         width="stretch"):
+                # Build a plausible packet from the pasture geometry.
+                test_ls = [[
+                    bbox[1] + 0.45 * (bbox[3] - bbox[1]) + 0.0001 * (i % 3),
+                    bbox[0] + 0.40 * (bbox[2] - bbox[0]) + 0.0001 * (i // 3),
+                ] for i in range(8)]
+                packet = {
+                    "drone_lat": bbox[1] + 0.10 * (bbox[3] - bbox[1]),
+                    "drone_lon": 0.5 * (bbox[0] + bbox[2]),
+                    "drone_alt": 25.0,
+                    "livestock": test_ls,
+                    "n_waypoints": n_waypoints,
+                }
+                resp = http_post_json(f"{api_base.rstrip('/')}/update_herd", packet)
+                if resp:
+                    st.success(f"Telemetry ingested (seq {resp['seq']}, "
+                               f"{resp['count']} waypoints returned).")
+                else:
+                    st.error("POST failed — is the API reachable at the base URL?")
+                st.rerun()
+        with cco2:
+            if st.button("🧪 GET /next_waypoints", width="stretch"):
+                st.session_state._endpoint_probe = http_get_json(
+                    f"{api_base.rstrip('/')}/next_waypoints")
+
+        probe = st.session_state.get("_endpoint_probe")
+        if probe is not None:
+            st.caption("Latest GET /next_waypoints response (served to the drone):")
+            st.json(probe)
+
+    if tele is None:
+        st.warning("Waiting for the first telemetry packet. Use **Push test "
+                   "telemetry** above, or POST to the endpoint, e.g.:")
+        st.code(
+            f"curl -X POST {api_base}/update_herd -H 'Content-Type: application/json' "
+            f"-d '{{\"drone_lat\": {0.5*(bbox[1]+bbox[3]):.5f}, "
+            f"\"drone_lon\": {0.5*(bbox[0]+bbox[2]):.5f}, "
+            f"\"livestock\": [[{0.5*(bbox[1]+bbox[3]):.5f}, "
+            f"{0.5*(bbox[0]+bbox[2]):.5f}]], \"n_waypoints\": 4}}'",
+            language="bash",
+        )
 
 
 # ==============================================================================
