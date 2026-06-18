@@ -41,7 +41,7 @@ import pydeck as pdk
 import streamlit as st
 
 import runtime_state as rs
-from model import RiskModel, DEFAULT_SWISS_PASTURE_POLYGON
+from model import RiskModel, DEFAULT_SWISS_PASTURE_POLYGON, smooth_path_lonlat
 
 # ------------------------------------------------------------------------------
 # Page configuration
@@ -808,16 +808,21 @@ if herd is not None and len(herd):
         pickable=False,
     ))
 
-# 4) Planned waypoint path (drone -> next waypoints)
+# 4) Planned waypoint path (drone -> next waypoints), smoothed into an
+#    aerodynamically feasible cubic-spline curve (passes through every waypoint).
 if result.waypoints:
-    wp_path = [list(drone)] + [[w["lon"], w["lat"]] for w in result.waypoints]
+    raw_path = [[drone[0], drone[1]]] + [[w["lon"], w["lat"]] for w in result.waypoints]
+    smooth = smooth_path_lonlat(raw_path, samples_per_segment=16)
+    smooth_path = [[float(x), float(y)] for x, y in smooth]
     layers.append(pdk.Layer(
         "PathLayer",
-        data=[{"path": wp_path}],
+        data=[{"path": smooth_path}],
         get_path="path",
-        get_color=[0, 200, 255, 200],
-        get_width=2.5,
-        width_min_pixels=2,
+        get_color=[0, 200, 255, 220],
+        get_width=3.0,
+        width_min_pixels=3,
+        cap_rounded=True,
+        joint_rounded=True,
     ))
     wp_df = pd.DataFrame(result.waypoints)
     wp_df["order"] = [str(i + 1) for i in range(len(wp_df))]

@@ -27,7 +27,8 @@
       "PowerShell(python test_live_api.py http://127.0.0.1:8010 2>&1 | Select-Object -Last 9 | Out-String | Write-Output; Write-Output \\(\"exit code: \" + $LASTEXITCODE\\))",
       "PowerShell($r = Invoke-WebRequest -Uri \"http://127.0.0.1:8010/state\" -UseBasicParsing -TimeoutSec 5; $j = $r.Content | ConvertFrom-Json; Write-Output \\(\"content-type: \" + $r.Headers['Content-Type']\\); Write-Output \\(\"seq: \" + $j.seq\\); Write-Output \\(\"telemetry livestock count: \" + $j.telemetry.livestock.Count\\); Write-Output \\(\"stored waypoints: \" + $j.waypoints.Count\\))",
       "PowerShell(Write-Output \"=== full loop test \\(test_live_api.py\\) ===\"; python test_live_api.py http://127.0.0.1:8011 2>&1 | Select-Object -Last 8 | Out-String | Write-Output; Write-Output \\(\"test exit: \" + $LASTEXITCODE\\); Write-Output \"\"; Write-Output \"=== keep_warm.py \\(resolves $env:GROUND_CONTROL_API_URL, single ping\\) ===\"; python keep_warm.py --once 2>&1 | Out-String | Write-Output; Write-Output \\(\"keep_warm exit: \" + $LASTEXITCODE\\))",
-      "PowerShell(Stop-Process *)"
+      "PowerShell(Stop-Process *)",
+      "PowerShell($env:PORT=\"8012\"; $env:DRONE_STATE_PATH=\"$env:TEMP\\\\drone_upg.json\"; Start-Process -FilePath \"python\" -ArgumentList \"-m\",\"uvicorn\",\"api:app\",\"--host\",\"0.0.0.0\",\"--port\",\"8012\" -RedirectStandardOutput \"_u_out.log\" -RedirectStandardError \"_u_err.log\" -WindowStyle Hidden; $ok=$false; for \\($i=0; $i -lt 30; $i++\\) { try { $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8012/health\" -UseBasicParsing -TimeoutSec 2; if \\($r.StatusCode -eq 200\\) { $ok=$true; break } } catch { Start-Sleep -Milliseconds 700 } }; Write-Output \\(\"API up: \" + $ok\\); Write-Output \"--- full loop test ---\"; python test_live_api.py http://127.0.0.1:8012 2>&1 | Select-Object -Last 7 | Out-String | Write-Output; Write-Output \\(\"loop exit: \" + $LASTEXITCODE\\))"
     ]
   }
 }

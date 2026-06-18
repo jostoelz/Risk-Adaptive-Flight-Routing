@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.interpolate import make_interp_spline
 from scipy.spatial import cKDTree
 from scipy.stats import gaussian_kde
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -78,6 +79,13 @@ _EARTH_RADIUS_M = 6_371_000.0
 # Approximate body length of an adult European wolf along the camera sensor.
 # Used together with MIN_DETECTION_SIZE_WOLF_PX to derive the max flight altitude.
 WOLF_CHARACTERISTIC_SIZE_M = 1.10
+
+# Spacing (metres) of the virtual nodes interpolated ALONG OSM feature edges.
+# Densifying the polylines turns sparse OSM vertices into a continuous, unbroken
+# high-risk buffer along the whole forest-pasture boundary.
+FEATURE_DENSIFY_SPACING_M = 7.0
+# Hard cap on densified feature points so a huge OSM way cannot explode the KDTree.
+_MAX_FEATURE_POINTS = 4000
 
 # ------------------------------------------------------------------------------
 # HARDCODED SWISS PASTURE FALLBACK (Rule 1).
@@ -392,27 +400,73 @@ class StaticFeatures:
         return int(self.points_lonlat.shape[0])
 
 
-def _sample_geometry_points(geom, max_pts: int = 40) -> List[Tuple[float, float]]:
-    """Extract representative (lon, lat) points from a shapely geometry."""
+def _densify_polyline_lonlat(
+    coords: Sequence[Tuple[float, float]],
+    spacing_m: float,
+    ref_lat: float,
+) -> List[Tuple[float, float]]:
+    """Insert virtual nodes every ~spacing_m metres along a (lon, lat) polyline.
+
+    Uses a local equirectangular scale at ``ref_lat`` to measure segment lengths
+    in metres, then linearly subdivides each segment. This converts sparse OSM
+    vertices into a continuous run of points so the downstream distance field has
+    no gaps along the edge.
+    """
+    pts = [(float(c[0]), float(c[1])) for c in coords]
+    if len(pts) < 2:
+        return pts
+    m_per_deg_lat = math.radians(1.0) * _EARTH_RADIUS_M
+    m_per_deg_lon = m_per_deg_lat * math.cos(math.radians(ref_lat))
+    spacing_m = max(float(spacing_m), 1e-6)
+
+    out: List[Tuple[float, float]] = []
+    for (lo0, la0), (lo1, la1) in zip(pts[:-1], pts[1:]):
+        dx = (lo1 - lo0) * m_per_deg_lon
+        dy = (la1 - la0) * m_per_deg_lat
+        seg_m = math.hypot(dx, dy)
+        n = max(1, int(math.ceil(seg_m / spacing_m)))
+        for k in range(n):  # include start, exclude end (added by next segment)
+            t = k / n
+            out.append((lo0 + t * (lo1 - lo0), la0 + t * (la1 - la0)))
+    out.append(pts[-1])
+    return out
+
+
+def _cap_points(arr: np.ndarray, max_n: int = _MAX_FEATURE_POINTS) -> np.ndarray:
+    """Stride-subsample a point array if it exceeds max_n (keeps it bounded)."""
+    if len(arr) > max_n:
+        stride = int(math.ceil(len(arr) / max_n))
+        return arr[::stride]
+    return arr
+
+
+def _sample_geometry_points(
+    geom,
+    ref_lat: float,
+    spacing_m: float = FEATURE_DENSIFY_SPACING_M,
+) -> List[Tuple[float, float]]:
+    """Extract DENSIFIED (lon, lat) points from a shapely geometry.
+
+    Lines and polygon boundaries are interpolated every ~spacing_m metres so the
+    forest-pasture edge becomes a continuous high-risk buffer rather than a few
+    scattered OSM nodes.
+    """
     pts: List[Tuple[float, float]] = []
     try:
         gtype = geom.geom_type
         if gtype == "Point":
             pts.append((geom.x, geom.y))
         elif gtype in ("LineString", "LinearRing"):
-            coords = list(geom.coords)
-            pts.extend((c[0], c[1]) for c in coords)
-        elif gtype in ("Polygon",):
-            coords = list(geom.exterior.coords)  # forest *edges* -> boundary
-            pts.extend((c[0], c[1]) for c in coords)
+            pts.extend(_densify_polyline_lonlat(list(geom.coords), spacing_m, ref_lat))
+        elif gtype == "Polygon":
+            # forest *edges* -> the exterior boundary, densified
+            pts.extend(_densify_polyline_lonlat(
+                list(geom.exterior.coords), spacing_m, ref_lat))
         elif gtype.startswith("Multi") or gtype == "GeometryCollection":
             for sub in geom.geoms:
-                pts.extend(_sample_geometry_points(sub, max_pts))
+                pts.extend(_sample_geometry_points(sub, ref_lat, spacing_m))
     except Exception:
         return []
-    if len(pts) > max_pts:  # thin out dense ways
-        idx = np.linspace(0, len(pts) - 1, max_pts).astype(int)
-        pts = [pts[i] for i in idx]
     return pts
 
 
@@ -443,6 +497,7 @@ def _fetch_features_osmnx(ring: np.ndarray) -> Optional[StaticFeatures]:
         return None
 
     poly = ShapelyPolygon([(lon, lat) for lon, lat in ring])
+    ref_lat = float(np.mean(ring[:, 1]))
     collected: List[Tuple[float, float]] = []
     forest: List[Tuple[float, float]] = []
     for name, tags in _OSM_FEATURE_TAGS.items():
@@ -459,7 +514,7 @@ def _fetch_features_osmnx(ring: np.ndarray) -> Optional[StaticFeatures]:
                 continue
             pts_this: List[Tuple[float, float]] = []
             for geom in gdf.geometry:
-                pts_this.extend(_sample_geometry_points(geom))
+                pts_this.extend(_sample_geometry_points(geom, ref_lat))
             collected.extend(pts_this)
             if name == "forest":
                 forest.extend(pts_this)
@@ -468,8 +523,8 @@ def _fetch_features_osmnx(ring: np.ndarray) -> Optional[StaticFeatures]:
     if not collected:
         return None
     return StaticFeatures(
-        np.asarray(collected, dtype=float), source="osmnx",
-        forest_points_lonlat=(np.asarray(forest, dtype=float)
+        _cap_points(np.asarray(collected, dtype=float)), source="osmnx",
+        forest_points_lonlat=(_cap_points(np.asarray(forest, dtype=float))
                               if forest else np.empty((0, 2))),
     )
 
@@ -496,15 +551,18 @@ def _fetch_features_overpy(ring: np.ndarray) -> Optional[StaticFeatures]:
         result = api.query(query)
     except Exception:
         return None
+    ref_lat = float(np.mean(ring[:, 1]))
     collected: List[Tuple[float, float]] = []
     forest: List[Tuple[float, float]] = []
     for way in getattr(result, "ways", []):
-        pts_this: List[Tuple[float, float]] = []
+        node_pts: List[Tuple[float, float]] = []
         for node in way.get_nodes(resolve_missing=False) or []:
             try:
-                pts_this.append((float(node.lon), float(node.lat)))
+                node_pts.append((float(node.lon), float(node.lat)))
             except Exception:
                 continue
+        # Densify along the way so the edge buffer is continuous.
+        pts_this = _densify_polyline_lonlat(node_pts, FEATURE_DENSIFY_SPACING_M, ref_lat)
         collected.extend(pts_this)
         tags = getattr(way, "tags", {}) or {}
         if tags.get("natural") == "wood" or tags.get("landuse") == "forest":
@@ -512,8 +570,8 @@ def _fetch_features_overpy(ring: np.ndarray) -> Optional[StaticFeatures]:
     if not collected:
         return None
     return StaticFeatures(
-        np.asarray(collected, dtype=float), source="overpy",
-        forest_points_lonlat=(np.asarray(forest, dtype=float)
+        _cap_points(np.asarray(collected, dtype=float)), source="overpy",
+        forest_points_lonlat=(_cap_points(np.asarray(forest, dtype=float))
                               if forest else np.empty((0, 2))),
     )
 
@@ -527,19 +585,22 @@ def _synthetic_features(grid: Grid) -> StaticFeatures:
     lon_min, lon_max = grid.lons.min(), grid.lons.max()
     lat_min, lat_max = grid.lats.min(), grid.lats.max()
 
-    t = np.linspace(0.0, 1.0, 24)
-    # Forest edge near the top (north) of the parcel.
-    forest_lon = lon_min + t * (lon_max - lon_min)
-    forest_lat = np.full_like(t, lat_max - 0.06 * (lat_max - lat_min))
+    ref_lat = float(np.mean(grid.lats))
+    # Forest edge near the top (north) of the parcel -- two endpoints, densified.
+    forest_lat_val = lat_max - 0.06 * (lat_max - lat_min)
+    forest_line = [(lon_min, forest_lat_val), (lon_max, forest_lat_val)]
     # Creek cutting diagonally across the parcel.
-    creek_lon = lon_min + 0.15 * (lon_max - lon_min) + t * 0.7 * (lon_max - lon_min)
-    creek_lat = lat_min + 0.85 * (lat_max - lat_min) - t * 0.7 * (lat_max - lat_min)
+    creek_line = [
+        (lon_min + 0.15 * (lon_max - lon_min), lat_min + 0.85 * (lat_max - lat_min)),
+        (lon_min + 0.85 * (lon_max - lon_min), lat_min + 0.15 * (lat_max - lat_min)),
+    ]
+    forest_dens = _densify_polyline_lonlat(
+        forest_line, FEATURE_DENSIFY_SPACING_M, ref_lat)
+    creek_dens = _densify_polyline_lonlat(
+        creek_line, FEATURE_DENSIFY_SPACING_M, ref_lat)
 
-    pts = np.column_stack([
-        np.concatenate([forest_lon, creek_lon]),
-        np.concatenate([forest_lat, creek_lat]),
-    ])
-    forest_pts = np.column_stack([forest_lon, forest_lat])
+    pts = np.asarray(forest_dens + creek_dens, dtype=float)
+    forest_pts = np.asarray(forest_dens, dtype=float)
     return StaticFeatures(pts, source="synthetic", forest_points_lonlat=forest_pts)
 
 
@@ -1002,6 +1063,60 @@ def plan_receding_horizon(
             "risk": float(risk[ry, rx]),
         })
     return waypoints
+
+
+# ==============================================================================
+# 8b. AERODYNAMIC PATH SMOOTHING  (Cubic spline over the RHC/TSP waypoints)
+# ==============================================================================
+
+def smooth_path_lonlat(
+    points: Sequence[Sequence[float]],
+    samples_per_segment: int = 14,
+) -> np.ndarray:
+    """
+    Smooth a discrete waypoint path into an aerodynamically feasible curve.
+
+    The grid-based RHC/TSP planner emits waypoints on cell centres, which strung
+    together produce rigid ~90-degree corners no real drone can fly. We fit a
+    cubic B-spline (scipy.interpolate.make_interp_spline, degree min(3, n-1))
+    parameterised by cumulative chord length and resample it densely.
+
+    The spline is INTERPOLATING -- it passes exactly through every planned
+    waypoint -- so each cell's safe altitude/velocity target is still honoured;
+    only the connecting trajectory between them is rounded into a smooth curve.
+
+    Parameters
+    ----------
+    points : sequence of [lon, lat] (e.g. [drone, wp1, wp2, ...]).
+    Returns
+    -------
+    (M, 2) array of [lon, lat] along the smoothed curve (the original points when
+    there are fewer than 3 distinct nodes -- nothing to smooth).
+    """
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    if pts.shape[0] < 2:
+        return pts.copy()
+
+    # Drop consecutive duplicates (a strictly increasing parameter is required).
+    keep = np.concatenate([[True], np.any(np.abs(np.diff(pts, axis=0)) > 0, axis=1)])
+    pts = pts[keep]
+    n = pts.shape[0]
+    if n < 3:
+        return pts.copy()
+
+    seg = np.sqrt((np.diff(pts, axis=0) ** 2).sum(axis=1))
+    t = np.concatenate([[0.0], np.cumsum(seg)])
+    if t[-1] <= 0:
+        return pts.copy()
+    t = t / t[-1]
+
+    k = min(3, n - 1)
+    try:
+        spline = make_interp_spline(t, pts, k=k)
+    except Exception:
+        return pts.copy()
+    tt = np.linspace(0.0, 1.0, (n - 1) * max(2, samples_per_segment) + 1)
+    return np.asarray(spline(tt), dtype=float)
 
 
 # ==============================================================================
