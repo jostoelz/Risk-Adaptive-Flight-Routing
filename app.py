@@ -215,6 +215,22 @@ def advance_drone(drone: Tuple[float, float], waypoints, lat0, dt_s
 # REAL DRONE MODE — FastAPI Ground Control integration
 # ==============================================================================
 
+def configured_api_url() -> Optional[str]:
+    """Public API URL configured out-of-band, for a cloud-native default.
+
+    Priority: Streamlit secret `ground_control_api_url` → env GROUND_CONTROL_API_URL.
+    Returns None if neither is set (dashboard then defaults to the embedded API).
+    """
+    try:
+        url = st.secrets.get("ground_control_api_url")  # type: ignore[attr-defined]
+        if url:
+            return str(url).rstrip("/")
+    except Exception:
+        pass
+    url = os.environ.get("GROUND_CONTROL_API_URL")
+    return url.rstrip("/") if url else None
+
+
 @st.cache_resource(show_spinner=False)
 def ensure_embedded_api(host: str, port: int) -> dict:
     """Start the FastAPI Ground Control server once per Streamlit process.
@@ -419,15 +435,39 @@ reset_clicked = c2.button("🔄 Reset", width="stretch")
 
 # --- Real Drone Ground Control configuration ---
 st.sidebar.markdown("### 📡 Ground Control (Real Drone)")
-api_host = st.sidebar.text_input("Embedded API host", value="0.0.0.0",
-                                 disabled=is_sim)
-api_port = st.sidebar.number_input("Embedded API port", min_value=1024,
-                                   max_value=65535, value=8000, step=1,
-                                   disabled=is_sim)
-api_base = st.sidebar.text_input(
-    "API base URL (the Pi POSTs here)", value=f"http://localhost:{int(api_port)}",
+
+_configured_url = configured_api_url()  # from st.secrets / env, or None
+_default_hosted = _configured_url is not None
+
+api_source = st.sidebar.radio(
+    "API source",
+    ["Hosted (public URL)", "Embedded (this server)"],
+    index=0 if _default_hosted else 1,
     disabled=is_sim,
-    help="Standalone deployment: point this at the host running `uvicorn api:app`.")
+    help="Hosted: a standalone FastAPI deployed on Render/Railway — works from "
+         "anywhere, including a real Raspberry Pi. Embedded: run the API in-process "
+         "on this server (great locally; not publicly reachable on Streamlit Cloud).",
+)
+use_embedded = api_source.startswith("Embedded")
+
+if use_embedded:
+    api_host = st.sidebar.text_input("Embedded API host", value="0.0.0.0",
+                                     disabled=is_sim)
+    api_port = st.sidebar.number_input("Embedded API port", min_value=1024,
+                                       max_value=65535, value=8000, step=1,
+                                       disabled=is_sim)
+    api_base = f"http://localhost:{int(api_port)}"
+else:
+    api_host, api_port = None, None
+    api_base = st.sidebar.text_input(
+        "Public API base URL",
+        value=(_configured_url or "https://drone-ground-control-api.onrender.com"),
+        disabled=is_sim,
+        help="Your deployed FastAPI URL (no trailing slash). The Raspberry Pi "
+             "POSTs telemetry here and the flight controller pulls waypoints here.",
+    )
+
+st.sidebar.caption(f"🔗 Endpoints → `{api_base}`")
 
 
 # ==============================================================================
@@ -533,12 +573,17 @@ if is_sim:
 
 else:
     # ---- REAL DRONE MODE: feed comes from the FastAPI endpoints ----
-    # Start the embedded Ground Control server once (one-click deployment).
-    api_status = ensure_embedded_api(api_host, int(api_port))
+    if use_embedded:
+        # Start the embedded Ground Control server once (one-click local deploy).
+        api_status = ensure_embedded_api(api_host, int(api_port))
+    else:
+        # Hosted standalone API (Render/Railway). Nothing to start locally.
+        api_status = {"started": False, "hosted": True, "url": api_base}
     if not st.session_state.get("terminal_log"):
-        term_log("STARTUP", f"Ground Control online — FastAPI endpoints live on "
-                            f"{api_host}:{int(api_port)} (POST /update_herd · "
-                            f"GET /next_waypoints)")
+        where = ("embedded on this server" if use_embedded
+                 else f"hosted at {api_base}")
+        term_log("STARTUP", f"Ground Control online — {where} "
+                            f"(POST /update_herd · GET /next_waypoints)")
 
     # Pull the live shared state (written by POST /update_herd). Prefer an HTTP
     # GET /state against the configured base URL; fall back to the local store.
@@ -622,14 +667,16 @@ m4.metric("Active threats", f"{len(threats)}")
 m5.metric("Cycle / tick", f"{st.session_state.tick}")
 
 if not is_sim:
-    served = api_status.get("started") if isinstance(api_status, dict) else False
     healthy = http_get_json(f"{api_base.rstrip('/')}/health") is not None
     badge = "🟢 reachable" if healthy else "🟠 starting / unreachable"
+    where = "embedded (this server)" if use_embedded else f"hosted · `{api_base}`"
+    extra = ("" if healthy or use_embedded else
+             " — a free hosted API may be cold-starting; retry in ~30 s.")
     st.info(
         f"**REAL DRONE MODE** — synthetic generation is **OFF**. Ground Control "
-        f"API embedded on `{api_host}:{int(api_port)}` ({badge}). The Raspberry "
-        f"Pi pushes `[drone GPS, livestock]` to **POST {api_base}/update_herd** "
-        f"and the flight controller pulls **GET {api_base}/next_waypoints**."
+        f"API: {where} ({badge}).{extra} The Raspberry Pi pushes "
+        f"`[drone GPS, livestock]` to **POST {api_base}/update_herd** and the "
+        f"flight controller pulls **GET {api_base}/next_waypoints**."
     )
 
     with st.expander("📡 Endpoint console (live)", expanded=(tele is None)):

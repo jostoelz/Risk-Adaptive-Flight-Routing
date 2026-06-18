@@ -1,0 +1,29 @@
+# ==============================================================================
+# render.yaml — deploy the FastAPI Ground Control Station (api.py) on Render.
+# Project: Autonomous Risk-Based Drone Patrolling (ETH AI Sprint 2026)
+#
+# This is a Render Blueprint. To deploy:
+#   1. Push this repo to GitHub.
+#   2. Render Dashboard → New → Blueprint → pick this repo → Apply.
+# Render auto-detects this file, builds with requirements-api.txt, and serves
+# uvicorn on the public $PORT it injects. The result is a public HTTPS URL like
+#   https://drone-ground-control-api.onrender.com
+# which the Raspberry Pi (and the Streamlit dashboard) can reach from anywhere.
+# ==============================================================================
+services:
+  - type: web
+    name: drone-ground-control-api
+    runtime: python
+    plan: free
+    region: frankfurt            # closest to Switzerland; change if preferred
+    buildCommand: "pip install -r requirements-api.txt"
+    # Render provides $PORT; bind to it on 0.0.0.0 for public reachability.
+    startCommand: "uvicorn api:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Keep telemetry state on a writeable path inside the instance.
+      - key: DRONE_STATE_PATH
+        value: "/tmp/drone_patrol_state.json"
