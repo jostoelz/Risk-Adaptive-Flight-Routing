@@ -1,0 +1,25 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build / packaging
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime / local artifacts
+*.log
+drone_patrol_state*.json   # local telemetry store (runtime_state.py)
+_*.py                       # scratch/smoke-test scripts
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
