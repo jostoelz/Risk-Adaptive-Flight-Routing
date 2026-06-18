@@ -772,6 +772,100 @@ def _fixed_bump_density(grid: Grid, lx: np.ndarray, ly: np.ndarray,
     return dens
 
 
+def select_focus_cluster(
+    livestock_lonlat: Optional[np.ndarray],
+    drone_lonlat: Optional[Tuple[float, float]],
+    lock_centroid: Optional[Tuple[float, float]] = None,
+    hysteresis_m: float = 50.0,
+    min_separation_m: float = 45.0,
+    gap_factor: float = 2.2,
+) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], bool]:
+    """
+    Pick the herd sub-group the drone should guard, with hysteresis.
+
+    When the herd splits into two groups a single KDE develops a zero-gradient
+    SADDLE between them, making the planner jitter in the middle. To avoid this
+    we detect a bimodal split (largest gap along the herd's principal axis) and,
+    if real, lock the planner onto ONE group:
+
+      * No prior lock  -> choose the group whose centroid is nearest the drone.
+      * Prior lock      -> stay on the group continuous with the locked centroid,
+                           and switch to the other group ONLY when it becomes
+                           `hysteresis_m` closer to the drone. This hysteresis
+                           kills the flip-flop at the midpoint.
+
+    Returns (subset_lonlat, chosen_centroid_lonlat, is_split).
+    When not split it returns (all points, None, False) — the caller clears the
+    lock so a fresh split re-selects by drone proximity. A wolf near the other
+    group is handled separately by the threat field, which can still pull the
+    drone across.
+    """
+    if livestock_lonlat is None:
+        return None, None, False
+    pts = np.asarray(livestock_lonlat, dtype=float).reshape(-1, 2)
+    n = pts.shape[0]
+    if n == 0:
+        return pts, None, False
+    if n < 4 or drone_lonlat is None:
+        return pts, None, False
+
+    # Local metric scale (lon/lat -> metres) at the herd's latitude.
+    ref_lat = float(np.mean(pts[:, 1]))
+    mlat = math.radians(1.0) * _EARTH_RADIUS_M
+    mlon = mlat * math.cos(math.radians(ref_lat))
+
+    def _m(a, b):  # distance in metres between two (lon, lat) points
+        return math.hypot((a[0] - b[0]) * mlon, (a[1] - b[1]) * mlat)
+
+    # Split along the principal axis at the largest gap.
+    c = pts.mean(axis=0)
+    X = np.column_stack([(pts[:, 0] - c[0]) * mlon, (pts[:, 1] - c[1]) * mlat])
+    try:
+        _, _, vt = np.linalg.svd(X, full_matrices=False)
+    except Exception:
+        return pts, None, False
+    proj = X @ vt[0]
+    order = np.argsort(proj)
+    gaps = np.diff(proj[order])
+    if gaps.size == 0:
+        return pts, None, False
+    gi = int(np.argmax(gaps))
+    max_gap = float(gaps[gi])
+    med_gap = float(np.median(gaps))
+    med_gap = med_gap if med_gap > 1e-9 else 1e-9
+
+    idx_a, idx_b = order[:gi + 1], order[gi + 1:]
+    if idx_a.size < 2 or idx_b.size < 2:
+        return pts, None, False
+
+    ca = tuple(pts[idx_a].mean(axis=0))
+    cb = tuple(pts[idx_b].mean(axis=0))
+    sep_m = _m(ca, cb)
+    # Only treat as a genuine split if the gap is clearly bimodal AND the groups
+    # are physically far apart; otherwise it is one blob -> use everything.
+    if not (max_gap > gap_factor * med_gap and sep_m > min_separation_m):
+        return pts, None, False
+
+    da, db = _m(ca, drone_lonlat), _m(cb, drone_lonlat)
+
+    if lock_centroid is not None:
+        # Continuity: the group whose centroid is nearest the locked one.
+        if _m(ca, lock_centroid) <= _m(cb, lock_centroid):
+            cont_idx, cont_c, cont_d = idx_a, ca, da
+            alt_idx, alt_c, alt_d = idx_b, cb, db
+        else:
+            cont_idx, cont_c, cont_d = idx_b, cb, db
+            alt_idx, alt_c, alt_d = idx_a, ca, da
+        if alt_d + hysteresis_m < cont_d:      # other group decisively closer
+            chosen_idx, chosen_c = alt_idx, alt_c
+        else:
+            chosen_idx, chosen_c = cont_idx, cont_c
+    else:
+        chosen_idx, chosen_c = (idx_a, ca) if da <= db else (idx_b, cb)
+
+    return pts[chosen_idx], (float(chosen_c[0]), float(chosen_c[1])), True
+
+
 # ==============================================================================
 # 5b. ACTIVE THREAT FIELD  (Virtual Wolf Spawn)
 # ==============================================================================
@@ -1227,6 +1321,8 @@ class RiskModel:
         # planner is genuinely drawn to forest edges and the map reads true.
         self.baseline = np.clip(
             np.maximum(self.baseline_gpr, self.forest_proximity), 0.0, 1.0)
+        # Hysteresis lock for split-herd tracking (which sub-group we guard).
+        self._locked_cluster_centroid: Optional[Tuple[float, float]] = None
 
     def update(
         self,
@@ -1240,7 +1336,12 @@ class RiskModel:
         `threats_lonlat` carries any active virtual-wolf spawns; passing them in
         forces the risk matrix (and hence the planner) to recalibrate.
         """
-        herd_proximity = compute_herd_proximity(self.grid, livestock_lonlat)
+        # Split-herd focus: lock onto the nearest sub-group (with hysteresis) so a
+        # bimodal KDE saddle never makes the drone jitter between two groups.
+        focus_subset, focus_centroid, _is_split = select_focus_cluster(
+            livestock_lonlat, drone_lonlat, self._locked_cluster_centroid)
+        self._locked_cluster_centroid = focus_centroid
+        herd_proximity = compute_herd_proximity(self.grid, focus_subset)
         threat_field = compute_threat_field(self.grid, threats_lonlat)
         # V2.0: couple the static forest-edge field to the live herd proximity.
         risk = combine_risk(
