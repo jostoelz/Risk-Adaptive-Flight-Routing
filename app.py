@@ -738,12 +738,12 @@ if not is_sim:
 
 layers = []
 
-# 1) Risk heatmap — coloured by max(live risk, forest proximity). Deep crimson
-#    = within 20 m of an OSM forest edge; smooth green/yellow toward the centre.
+# 1) Risk heatmap — coloured by the V2.0 dynamic risk (Forest × Herd). Deep
+#    crimson concentrates on the forest edge nearest the herd (the active danger
+#    zone) and travels with the animals; green/yellow elsewhere.
 _ELEV_SCALE = 90.0 if show_3d else 0.0
 heat_records = build_heatmap_records(
     result.grid, result.risk,
-    forest_prox=result.forest_proximity,
     forest_dist=result.forest_distance_m,
     elevation_scale=_ELEV_SCALE,
 )
@@ -915,9 +915,9 @@ st.markdown(
                   background:linear-gradient(90deg, {RISK_GRADIENT_CSS});"></div>
       <div style="display:flex;justify-content:space-between;
                   font-size:0.78rem;color:#cfcfcf;margin-top:3px;">
-        <span>🟢 Safe — open centre</span>
-        <span>🟡 Elevated</span>
-        <span>🔴 High — ≤ 20 m from forest edge</span>
+        <span>🟢 Safe</span>
+        <span>🟡 Herd in the open</span>
+        <span>🔴 High — forest edge nearest the herd (active danger zone)</span>
       </div>
     </div>
     """,
@@ -977,13 +977,13 @@ with right:
     st.markdown(
         f"""
         <div style="font-size:0.85rem;color:#cfcfcf;margin-bottom:6px;">
-          <b>Risk grid</b> — cell colour = wolf-intrusion risk:
+          <b>Risk grid</b> — cell colour = <i>Forest&nbsp;×&nbsp;Herd</i> risk:
         </div>
         <div style="height:14px;border-radius:7px;border:1px solid #ffffff33;
                     background:linear-gradient(90deg, {RISK_GRADIENT_CSS});"></div>
         <div style="display:flex;justify-content:space-between;font-size:0.72rem;
                     color:#bbb;margin:2px 0 10px 0;">
-          <span>safe</span><span>≤ 20 m to forest</span>
+          <span>safe</span><span>forest edge by the herd</span>
         </div>
         {rows_html}
         """,
@@ -999,12 +999,15 @@ with right:
 with st.expander("ℹ️ How the pipeline reacts to your controls"):
     st.markdown(
         """
+        * **V2.0 dynamic risk** = *Forest proximity × Herd proximity*. The peak
+          risk concentrates on the forest edge **closest to the herd**, so as the
+          animals move the red hotspots — and the spline flight path — follow them.
         * **Hardware sliders** re-derive the per-cell *flight envelope* instantly:
           lower `min wolf px` / higher altitude ⇒ faster flight; a larger
           *weather/visibility buffer* forces more image overlap ⇒ the drone flies
           **lower and slower** to avoid blind spots.
-        * **Livestock risk gain** controls how strongly herd density (KDE)
-          exponentially amplifies the GPR baseline risk.
+        * **Livestock risk gain** controls how strongly the herd-coupled term
+          dominates the static creek/hedge structure.
         * **Trigger Virtual Wolf Spawn** adds a sharply-peaked threat near natural
           cover; the risk matrix renormalises so the planner is pulled toward the
           threat on the very next cycle.

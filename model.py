@@ -710,48 +710,59 @@ def compute_forest_proximity(
 
 
 # ==============================================================================
-# 5. LIVESTOCK DENSITY VIA KDE  (Rule 2)
+# 5. HERD PROXIMITY FIELD VIA KDE  (Rule 2)  — the dynamic half of V2.0 risk
 # ==============================================================================
 
-def compute_livestock_density(
+def compute_herd_proximity(
     grid: Grid,
     livestock_lonlat: Optional[np.ndarray],
+    guard_radius_m: float = 70.0,
 ) -> np.ndarray:
     """
-    Kernel-density estimate of the herd over the grid (scipy.stats.gaussian_kde).
-    Returns a field in [0, 1] (0 == no animals nearby). Shaped (ny, nx).
+    Smooth herd-proximity field H in [0, 1] (scipy.stats.gaussian_kde).
+
+    H is ~1 at the herd and decays smoothly over a protective 'guard radius' —
+    the zone the drone must keep watch over. The KDE bandwidth is widened to
+    roughly `guard_radius_m` so forest edges a short distance from the animals
+    still fall inside the field; a fixed Gaussian-bump fallback covers tiny or
+    degenerate herds. It is recomputed from live coordinates every cycle, so the
+    field — and therefore the coupled forest hotspots — travel with the herd.
+    Shaped (ny, nx).
     """
     ny, nx = grid.shape
     if livestock_lonlat is None or len(livestock_lonlat) == 0:
         return np.zeros((ny, nx), dtype=float)
 
-    livestock_lonlat = np.asarray(livestock_lonlat, dtype=float).reshape(-1, 2)
-    lx, ly = grid.lonlat_to_xy(livestock_lonlat[:, 0], livestock_lonlat[:, 1])
+    ll = np.asarray(livestock_lonlat, dtype=float).reshape(-1, 2)
+    lx, ly = grid.lonlat_to_xy(ll[:, 0], ll[:, 1])
     sample = np.vstack([lx, ly])  # shape (2, N)
 
-    if sample.shape[1] < 3 or np.allclose(sample.std(axis=1), 0):
-        # Too few / coincident points for a covariance -> use a fixed Gaussian bump.
-        return _fixed_bump_density(grid, lx, ly)
+    field = None
+    if sample.shape[1] >= 3 and not np.allclose(sample.std(axis=1), 0.0):
+        try:
+            # Widen the kernel so its std ≈ guard radius (bw factor ≈ guard/spread).
+            spread = max(float(np.hypot(sample[0].std(), sample[1].std())), 1.0)
+            bw = float(np.clip(guard_radius_m / spread, 0.15, 25.0))
+            kde = gaussian_kde(sample, bw_method=bw)
+            GX, GY = grid.mesh_xy()
+            field = kde(np.vstack([GX.ravel(), GY.ravel()])).reshape(ny, nx)
+        except Exception:
+            field = None
 
-    try:
-        kde = gaussian_kde(sample)  # Scott's rule bandwidth
-    except Exception:
-        return _fixed_bump_density(grid, lx, ly)
+    if field is None:
+        field = _fixed_bump_density(grid, lx, ly, sigma_m=guard_radius_m)
 
+    fmax = field.max()
+    if fmax > 0:
+        field = field / fmax  # normalise to [0, 1]
+    return field
+
+
+def _fixed_bump_density(grid: Grid, lx: np.ndarray, ly: np.ndarray,
+                        sigma_m: Optional[float] = None) -> np.ndarray:
+    """Fallback herd field: sum of fixed-width Gaussians around each animal."""
     GX, GY = grid.mesh_xy()
-    query = np.vstack([GX.ravel(), GY.ravel()])
-    dens = kde(query).reshape(ny, nx)
-
-    dmax = dens.max()
-    if dmax > 0:
-        dens = dens / dmax  # normalise to [0, 1]
-    return dens
-
-
-def _fixed_bump_density(grid: Grid, lx: np.ndarray, ly: np.ndarray) -> np.ndarray:
-    """Fallback density: sum of fixed-width Gaussians around each animal."""
-    GX, GY = grid.mesh_xy()
-    sigma = max(grid.cell_size_m * 1.5, 20.0)
+    sigma = float(sigma_m) if sigma_m else max(grid.cell_size_m * 1.5, 20.0)
     dens = np.zeros(GX.shape, dtype=float)
     for x0, y0 in zip(np.atleast_1d(lx), np.atleast_1d(ly)):
         dens += np.exp(-((GX - x0) ** 2 + (GY - y0) ** 2) / (2.0 * sigma ** 2))
@@ -797,33 +808,50 @@ def compute_threat_field(
 
 
 # ==============================================================================
-# 6. RISK COMBINATION + STRICT NORMALISATION  (Rule 3)
+# 6. RISK COMBINATION + STRICT NORMALISATION  (Rule 3)  — V2.0 dynamic coupling
 # ==============================================================================
 
 def combine_risk(
-    baseline: np.ndarray,
-    density: np.ndarray,
+    forest_proximity: np.ndarray,
+    herd_proximity: np.ndarray,
+    baseline_gpr: np.ndarray,
     mask: np.ndarray,
     livestock_gain: float = 2.5,
     threat_field: Optional[np.ndarray] = None,
     threat_weight: float = 25.0,
+    w_couple: float = 1.0,
+    w_herd: float = 0.35,
+    w_static: float = 0.15,
 ) -> np.ndarray:
     """
-    Combine the GPR baseline with the KDE livestock density. Dense clusters
-    EXPONENTIALLY scale the underlying cell risk (architecture spec), then the
-    matrix is STRICTLY clamped/normalised to [0, 1] to prevent overflow (Rule 3).
+    V2.0 dynamic risk: couple the continuous forest-edge field to the live herd.
 
-        risk_raw = baseline * exp(gain * density) + threat_weight * threat
-        risk     = (risk_raw - min) / (max - min)         # -> [0, 1]
+        coupled  = forest_proximity * herd_proximity     # forest edge NEAR herd
+        dynamic  = w_couple * coupled + w_herd * herd_proximity
+        risk_raw = livestock_gain * dynamic + w_static * baseline_gpr
+                   (+ threat_weight * wolf_threat,  when a wolf is active)
+        risk     = (risk_raw - min) / (max - min)         # strictly -> [0, 1]
 
-    An active threat (virtual wolf) is added with a large weight so it dominates
-    the matrix locally and dynamically recalibrates the whole map after spawn.
+    Why this shape (architecture V2.0):
+      * The PRODUCT term concentrates the absolute peak risk on the stretch of
+        forest edge closest to the herd — the active danger zone — instead of
+        lighting up the whole boundary.
+      * The herd term keeps the drone near the animals even in open ground.
+      * The faint static term preserves creek/hedge structure.
+    Because herd_proximity is recomputed from live coordinates each cycle, the
+    hotspots shift with the herd and the RHC planner re-routes to follow them.
+
+    The matrix is strictly min-max normalised to [0, 1] to prevent overflow; an
+    active wolf threat is added with a large weight so it dominates locally.
     """
-    baseline = np.clip(np.nan_to_num(baseline, nan=0.0), 0.0, 1.0)
-    density = np.clip(np.nan_to_num(density, nan=0.0), 0.0, 1.0)
-    gain = float(np.clip(livestock_gain, 0.0, 10.0))  # bound the exponent
+    F = np.clip(np.nan_to_num(forest_proximity, nan=0.0), 0.0, 1.0)
+    H = np.clip(np.nan_to_num(herd_proximity, nan=0.0), 0.0, 1.0)
+    B = np.clip(np.nan_to_num(baseline_gpr, nan=0.0), 0.0, 1.0)
+    g = float(np.clip(livestock_gain, 0.0, 10.0))
 
-    risk_raw = baseline * np.exp(gain * density)  # exp arg in [0, gain] -> finite
+    coupled = F * H                                   # forest ∩ herd hotspot
+    dynamic = w_couple * coupled + w_herd * H
+    risk_raw = g * dynamic + w_static * B
 
     if threat_field is not None:
         tf = np.clip(np.nan_to_num(threat_field, nan=0.0), 0.0, 1.0)
@@ -1180,11 +1208,12 @@ class RiskModel:
         `threats_lonlat` carries any active virtual-wolf spawns; passing them in
         forces the risk matrix (and hence the planner) to recalibrate.
         """
-        density = compute_livestock_density(self.grid, livestock_lonlat)
+        herd_proximity = compute_herd_proximity(self.grid, livestock_lonlat)
         threat_field = compute_threat_field(self.grid, threats_lonlat)
+        # V2.0: couple the static forest-edge field to the live herd proximity.
         risk = combine_risk(
-            self.baseline, density, self.grid.mask, self.livestock_gain,
-            threat_field=threat_field,
+            self.forest_proximity, herd_proximity, self.baseline_gpr,
+            self.grid.mask, self.livestock_gain, threat_field=threat_field,
         )
         env = compute_flight_envelope(risk, self.hw)
         waypoints = plan_receding_horizon(
@@ -1193,7 +1222,7 @@ class RiskModel:
         return RiskModelResult(
             grid=self.grid,
             baseline_risk=self.baseline,
-            livestock_density=density,
+            livestock_density=herd_proximity,
             risk=risk,
             altitude_m=env["altitude_m"],
             velocity_ms=env["velocity_ms"],
