@@ -1235,6 +1235,63 @@ def plan_receding_horizon(
     return waypoints
 
 
+def plan_orbit(
+    centroid_lonlat: Tuple[float, float],
+    drone_lonlat: Tuple[float, float],
+    grid: Grid,
+    risk: np.ndarray,
+    envelope: Dict[str, np.ndarray],
+    n_waypoints: int = 4,
+    radius_m: float = 22.0,
+    arc_span_deg: float = 150.0,
+    direction: int = 1,
+) -> List[Dict[str, float]]:
+    """
+    Orbit-Guard planner (Philosophy A Pro): a TRUE geometric bodyguard ring.
+
+    Rather than letting the MDP planner hunt the noisy individual-animal KDE bumps
+    at the cluster centre — which causes the waypoint chattering / cross-cutting —
+    we place the next `n_waypoints` on a smooth circle of `radius_m` around the
+    herd cluster's dynamic centroid, located AHEAD of the drone's current angular
+    position (fixed orbit direction) so the path is stable tick-to-tick and the
+    drone progresses smoothly around the ring. As the centroid drifts with the
+    herd, the ring translates, giving continuous tactical tracking. The returned
+    waypoints are fed through the same cubic B-spline smoother for rendering.
+
+    Output: list of {lat, lon, altitude_m, speed_ms, risk} on the orbit ring.
+    """
+    n = int(np.clip(n_waypoints, 3, 5))
+    clon, clat = float(centroid_lonlat[0]), float(centroid_lonlat[1])
+
+    mlat = math.radians(1.0) * _EARTH_RADIUS_M
+    mlon = mlat * math.cos(math.radians(clat))
+
+    # Drone's current bearing around the centroid (radians).
+    dxm = (drone_lonlat[0] - clon) * mlon
+    dym = (drone_lonlat[1] - clat) * mlat
+    theta0 = math.atan2(dym, dxm) if math.hypot(dxm, dym) > 1e-6 else 0.0
+
+    dstep = math.radians(float(arc_span_deg)) / n
+    direction = 1 if direction >= 0 else -1
+    ny, nx = grid.shape
+
+    waypoints: List[Dict[str, float]] = []
+    for k in range(1, n + 1):
+        th = theta0 + direction * k * dstep
+        wlon = clon + radius_m * math.cos(th) / mlon
+        wlat = clat + radius_m * math.sin(th) / mlat
+        rx = int(np.clip(np.argmin(np.abs(grid.lons - wlon)), 0, nx - 1))
+        ry = int(np.clip(np.argmin(np.abs(grid.lats - wlat)), 0, ny - 1))
+        waypoints.append({
+            "lat": float(wlat),
+            "lon": float(wlon),
+            "altitude_m": float(envelope["altitude_m"][ry, rx]),
+            "speed_ms": float(envelope["velocity_ms"][ry, rx]),
+            "risk": float(risk[ry, rx]),
+        })
+    return waypoints
+
+
 # ==============================================================================
 # 8b. AERODYNAMIC PATH SMOOTHING  (Cubic spline over the RHC/TSP waypoints)
 # ==============================================================================
@@ -1324,12 +1381,15 @@ class RiskModel:
         cell_size_m: float = 25.0,
         hardware_path: Optional[str] = None,
         livestock_gain: float = 2.5,
+        orbit_radius_m: float = 22.0,
     ):
         self.hw = (
             HardwareConstraints.from_file(hardware_path)
             if hardware_path else HardwareConstraints()
         )
         self.livestock_gain = livestock_gain
+        # Bodyguard orbit ring radius around the herd centroid (Philosophy A Pro).
+        self.orbit_radius_m = float(orbit_radius_m)
         self.grid = build_grid(polygon, cell_size_m=cell_size_m)
         # Static layers are fetched once (they do not change between cycles).
         self.features = fetch_static_features(self.grid)
@@ -1371,9 +1431,24 @@ class RiskModel:
             self.grid.mask, self.livestock_gain, threat_field=threat_field,
         )
         env = compute_flight_envelope(risk, self.hw)
-        waypoints = plan_receding_horizon(
-            risk, env, self.grid, drone_lonlat, n_waypoints=n_waypoints,
-        )
+
+        # Orbit-Guard (Philosophy A Pro): when a herd cluster is active, fly a
+        # smooth geometric ring around its dynamic centroid instead of letting
+        # the MDP rollout chatter on individual animals. Fall back to the MDP
+        # policy rollout when there is no herd (e.g. patrolling toward a threat).
+        orbit_center = None
+        if focus_subset is not None and len(focus_subset) > 0:
+            cen = np.asarray(focus_subset, dtype=float).reshape(-1, 2).mean(axis=0)
+            orbit_center = (float(cen[0]), float(cen[1]))
+        if orbit_center is not None:
+            waypoints = plan_orbit(
+                orbit_center, drone_lonlat, self.grid, risk, env,
+                n_waypoints=n_waypoints, radius_m=self.orbit_radius_m,
+            )
+        else:
+            waypoints = plan_receding_horizon(
+                risk, env, self.grid, drone_lonlat, n_waypoints=n_waypoints,
+            )
         return RiskModelResult(
             grid=self.grid,
             baseline_risk=self.baseline,

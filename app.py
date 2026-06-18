@@ -103,6 +103,8 @@ def build_heatmap_records(
     elevation_scale: float = 0.0,
     guarded_centroid=None,
     other_centroid=None,
+    altitude: np.ndarray = None,
+    velocity: np.ndarray = None,
 ) -> List[dict]:
     """One filled square polygon per in-polygon cell.
 
@@ -150,6 +152,11 @@ def build_heatmap_records(
                 "color": color,
                 "risk": round(r, 3),
                 "forest_m": fm,
+                # per-cell flight envelope, so the hover tooltip resolves cleanly
+                "altitude_m": (round(float(altitude[ry, rx]), 1)
+                               if altitude is not None else None),
+                "speed_ms": (round(float(velocity[ry, rx]), 1)
+                             if velocity is not None else None),
                 "elevation": round(disp * elevation_scale, 1),
             })
     return records
@@ -795,6 +802,8 @@ heat_records = build_heatmap_records(
     elevation_scale=_ELEV_SCALE,
     guarded_centroid=(result.guarded_centroid if result.is_split else None),
     other_centroid=(result.other_centroid if result.is_split else None),
+    altitude=result.altitude_m,
+    velocity=result.velocity_ms,
 )
 layers.append(pdk.Layer(
     "PolygonLayer",
@@ -907,7 +916,7 @@ if result.waypoints:
         get_radius=5,
         radius_min_pixels=4,
         radius_max_pixels=10,
-        pickable=True,
+        pickable=False,  # tooltip is served by the heatmap layer only
     ))
     layers.append(pdk.Layer(
         "TextLayer",
