@@ -1434,20 +1434,26 @@ class RiskModel:
 
         # Orbit-Guard (Philosophy A Pro): when a herd cluster is active, fly a
         # smooth geometric ring around its dynamic centroid instead of letting
-        # the MDP rollout chatter on individual animals. Fall back to the MDP
-        # policy rollout when there is no herd (e.g. patrolling toward a threat).
+        # the MDP rollout chatter on individual animals.
         orbit_center = None
         if focus_subset is not None and len(focus_subset) > 0:
             cen = np.asarray(focus_subset, dtype=float).reshape(-1, 2).mean(axis=0)
             orbit_center = (float(cen[0]), float(cen[1]))
-        if orbit_center is not None:
+
+        # Threat override: an active wolf dominates the risk field, so the drone
+        # BREAKS its orbit / lock and intercepts the danger zone via the MDP
+        # policy rollout (which climbs to the wolf's risk peak). With no threat it
+        # orbits the herd; with no herd it patrols via the rollout.
+        threats_active = (threats_lonlat is not None and
+                          np.asarray(threats_lonlat).reshape(-1, 2).shape[0] > 0)
+        if threats_active or orbit_center is None:
+            waypoints = plan_receding_horizon(
+                risk, env, self.grid, drone_lonlat, n_waypoints=n_waypoints,
+            )
+        else:
             waypoints = plan_orbit(
                 orbit_center, drone_lonlat, self.grid, risk, env,
                 n_waypoints=n_waypoints, radius_m=self.orbit_radius_m,
-            )
-        else:
-            waypoints = plan_receding_horizon(
-                risk, env, self.grid, drone_lonlat, n_waypoints=n_waypoints,
             )
         return RiskModelResult(
             grid=self.grid,

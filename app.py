@@ -41,6 +41,7 @@ import pydeck as pdk
 import streamlit as st
 
 import runtime_state as rs
+import scenarios
 from model import RiskModel, DEFAULT_SWISS_PASTURE_POLYGON, smooth_path_lonlat
 
 # ------------------------------------------------------------------------------
@@ -162,62 +163,8 @@ def build_heatmap_records(
     return records
 
 
-def init_herd(n: int, bbox, rng) -> np.ndarray:
-    """Initialise the herd as two clusters inside the pasture bounding box."""
-    lon_min, lat_min, lon_max, lat_max = bbox
-    span_lon, span_lat = lon_max - lon_min, lat_max - lat_min
-    centres = [
-        (lon_min + 0.35 * span_lon, lat_min + 0.40 * span_lat),
-        (lon_min + 0.68 * span_lon, lat_min + 0.62 * span_lat),
-    ]
-    pts = []
-    for i in range(n):
-        cx, cy = centres[i % len(centres)]
-        pts.append([
-            cx + rng.normal(0, 0.10 * span_lon * 0.25),
-            cy + rng.normal(0, 0.10 * span_lat * 0.25),
-        ])
-    return np.array(pts, dtype=float)
-
-
-def advance_herd(pos: np.ndarray, heading: np.ndarray, bbox, lat0, dt_s, rng,
-                 graze_speed=0.3, cohesion=0.15) -> Tuple[np.ndarray, np.ndarray]:
-    """Correlated random walk with light herd cohesion (boids-lite grazing).
-
-    graze_speed ~0.3 m/s is a realistic sheep grazing pace; the drone cruises at
-    DRONE_CRUISE_SPEED_MS (~11 m/s), giving a realistic ~35x UAV:herd speed ratio.
-    """
-    lon_min, lat_min, lon_max, lat_max = bbox
-    mlon = _m_per_deg_lon(lat0)
-    n = pos.shape[0]
-
-    # Perturb heading; bias slightly toward the herd centroid for clustering.
-    heading = heading + rng.normal(0.0, 0.5, size=n)
-    centroid = pos.mean(axis=0)
-    to_centre = centroid - pos
-    centre_ang = np.arctan2(to_centre[:, 1] * _M_PER_DEG_LAT,
-                            to_centre[:, 0] * mlon)
-    heading = (1 - cohesion) * heading + cohesion * centre_ang
-
-    step_m = graze_speed * dt_s
-    dx_m = step_m * np.cos(heading)
-    dy_m = step_m * np.sin(heading)
-    pos = pos.copy()
-    pos[:, 0] += dx_m / mlon
-    pos[:, 1] += dy_m / _M_PER_DEG_LAT
-
-    # Reflect off the pasture boundary (keep a small margin).
-    pad_lon = 0.04 * (lon_max - lon_min)
-    pad_lat = 0.04 * (lat_max - lat_min)
-    for k, (lo, hi, pad) in enumerate([
-        (lon_min, lon_max, pad_lon), (lat_min, lat_max, pad_lat)
-    ]):
-        below = pos[:, k] < lo + pad
-        above = pos[:, k] > hi - pad
-        pos[below, k] = lo + pad
-        pos[above, k] = hi - pad
-        heading[below | above] += math.pi  # turn around
-    return pos, heading
+# Herd initialisation & movement now live in scenarios.py (the simulation
+# engine), selected via the sidebar 'Select Simulation Scenario' dropdown.
 
 
 # Realistic UAV operational cruise speed used to advance the drone each tick.
@@ -410,22 +357,34 @@ def _bbox_from_model(model: RiskModel):
 
 
 def _reset_simulation() -> None:
-    """Reset herd, drone trail, threats and tick counter."""
+    """Reset the herd, drone, trail, threats and lock for the active scenario."""
     model = st.session_state.get("model")
     st.session_state.rng = np.random.default_rng(7)
     st.session_state.tick = 0
     st.session_state.threats = []
     st.session_state.drone_trail = []
+    st.session_state._live_seq = None
+    scenario = st.session_state.get("scenario", scenarios.SCENARIOS[0])
     if model is not None:
         bbox = _bbox_from_model(model)
         n = int(st.session_state.get("n_animals", 24))
-        st.session_state.herd = init_herd(n, bbox, st.session_state.rng)
-        st.session_state.heading = st.session_state.rng.uniform(
-            -math.pi, math.pi, size=n)
+        # The Panic scenario spawns a wolf on a real forest-edge cell.
+        wolf = (model.sample_threat_location(0)
+                if scenario == "Sudden Wolf Threat / Panic" else None)
+        herd, heading, meta = scenarios.init_scenario(
+            scenario, n, bbox, st.session_state.rng, wolf_lonlat=wolf)
+        st.session_state.herd = herd
+        st.session_state.heading = heading
+        st.session_state.scenario_meta = meta
+        st.session_state.threats = [meta["wolf"]] if meta.get("wolf") else []
         st.session_state.drone = (
             0.5 * (bbox[0] + bbox[2]),
             bbox[1] + 0.10 * (bbox[3] - bbox[1]),
         )
+        # Release any split-herd lock so the new scenario starts clean.
+        model._locked_cluster_centroid = None
+    # Mark which scenario this reset materialised (for change detection).
+    st.session_state._active_scenario = scenario
 
 
 # ==============================================================================
@@ -466,6 +425,13 @@ n_waypoints = st.sidebar.slider("Waypoints per cycle", 3, 5, 4, 1,
                                 help="Receding-horizon output length.")
 
 st.sidebar.markdown("### ⏯️ Simulation")
+scenario = st.sidebar.selectbox(
+    "Select Simulation Scenario", scenarios.SCENARIOS, index=0,
+    disabled=not is_sim,
+    help="Switching instantly resets the herd positions & movement vectors.",
+)
+st.session_state.scenario = scenario
+st.sidebar.caption(scenarios.SCENARIO_HELP.get(scenario, ""))
 n_animals = st.sidebar.slider("Number of livestock", 4, 60, 24, 1)
 sim_speed = st.sidebar.slider("Sim seconds per tick", 0.5, 8.0, 2.0, 0.5)
 auto_play = st.sidebar.toggle(
@@ -532,12 +498,13 @@ model = get_model(cell_size_m)
 bbox = _bbox_from_model(model)
 lat0 = 0.5 * (bbox[1] + bbox[3])
 
-# If the herd size changed, re-seed the simulation entities.
+# Re-seed the simulation if the scenario changed or the herd size changed.
+if st.session_state.get("_active_scenario") != scenario:
+    _reset_simulation()
 if "herd" not in st.session_state or st.session_state.herd.shape[0] != n_animals:
     _reset_simulation()
 if reset_clicked:
     _reset_simulation()
-    st.session_state._live_seq = None
     st.session_state.terminal_log = []
     if not is_sim:
         rs.reset()  # clear the live telemetry feed too
@@ -600,8 +567,10 @@ if is_sim:
     do_advance = auto_play or step_clicked or advance_once
     if do_advance:
         st.session_state.tick += 1
-        st.session_state.herd, st.session_state.heading = advance_herd(
-            st.session_state.herd, st.session_state.heading, bbox, lat0,
+        (st.session_state.herd, st.session_state.heading,
+         st.session_state.scenario_meta) = scenarios.advance_scenario(
+            scenario, st.session_state.herd, st.session_state.heading,
+            st.session_state.get("scenario_meta", {}), bbox, lat0,
             sim_speed, st.session_state.rng,
         )
 
