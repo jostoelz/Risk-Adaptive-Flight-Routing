@@ -26,14 +26,12 @@ SCENARIOS = [
     "Compact Herd",
     "Wide Split (2 Groups)",
     "Scattered / Fragmented",
-    "Sudden Wolf Threat / Panic",
 ]
 
 SCENARIO_HELP = {
     "Compact Herd": "Tight single cluster grazing slowly — smooth centred Bodyguard orbit.",
     "Wide Split (2 Groups)": "Herd separates into two groups ~60 m apart — SVD split + hysteresis lock.",
-    "Scattered / Fragmented": "Animals scattered across the field — KDE expands to cover the area.",
-    "Sudden Wolf Threat / Panic": "Wolf at the forest edge; herd flees, drone breaks orbit and intercepts.",
+    "Scattered / Fragmented": "Animals scattered across the field — KDE expands; drone sweeps the area.",
 }
 
 # Target separation for the split scenario (metres).
@@ -63,20 +61,18 @@ def init_scenario(
     n: int,
     bbox: Tuple[float, float, float, float],
     rng: np.random.Generator,
-    wolf_lonlat: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """Initialise herd positions/headings and scenario metadata.
 
     Returns (pos (n,2) lon/lat, heading (n,), meta). `meta` may carry:
       * "groups" -> (n,) int labels (split scenario)
-      * "wolf"   -> (lon, lat) of the spawned wolf (panic scenario)
     """
     n = int(max(n, 4))
     lon_min, lat_min, lon_max, lat_max = bbox
     dlon, dlat = lon_max - lon_min, lat_max - lat_min
     lat0 = 0.5 * (lat_min + lat_max)
     mlon = _m_per_deg_lon(lat0)
-    meta: Dict = {"name": name, "wolf": None, "groups": None}
+    meta: Dict = {"name": name, "groups": None}
     heading = rng.uniform(-math.pi, math.pi, size=n)
 
     if name == "Wide Split (2 Groups)":
@@ -94,17 +90,6 @@ def init_scenario(
             rng.uniform(lon_min + 0.1 * dlon, lon_max - 0.1 * dlon, n),
             rng.uniform(lat_min + 0.1 * dlat, lat_max - 0.1 * dlat, n),
         ]).astype(float)
-
-    elif name == "Sudden Wolf Threat / Panic":
-        if wolf_lonlat is None:  # fallback: northern (forest-edge) midpoint
-            wolf_lonlat = (lon_min + 0.5 * dlon, lat_max - 0.06 * dlat)
-        # Herd clustered south of the wolf so it can flee away from the edge.
-        cx, cy = lon_min + 0.5 * dlon, lat_min + 0.55 * dlat
-        pos = np.column_stack([
-            rng.normal(cx, 9.0 / mlon, n),
-            rng.normal(cy, 9.0 / _M_PER_DEG_LAT, n),
-        ]).astype(float)
-        meta["wolf"] = (float(wolf_lonlat[0]), float(wolf_lonlat[1]))
 
     else:  # "Compact Herd" (default)
         cx, cy = lon_min + 0.45 * dlon, lat_min + 0.45 * dlat
@@ -158,20 +143,6 @@ def advance_scenario(
         v = 0.6
         pos[:, 0] += v * dt_s * np.cos(heading) / mlon
         pos[:, 1] += v * dt_s * np.sin(heading) / mlat
-        _clamp_reflect(pos, heading, bbox)
-        return pos, heading, meta
-
-    if name == "Sudden Wolf Threat / Panic" and meta.get("wolf") is not None:
-        wolf = meta["wolf"]
-        awx = (pos[:, 0] - wolf[0]) * mlon
-        awy = (pos[:, 1] - wolf[1]) * mlat
-        norm = np.hypot(awx, awy)
-        norm[norm < 1e-6] = 1e-6
-        ux, uy = awx / norm, awy / norm           # unit vector AWAY from the wolf
-        v_flee = 2.5                              # panic run (~2.5 m/s)
-        pos[:, 0] += (v_flee * dt_s * ux + rng.normal(0, 0.3 * dt_s, n)) / mlon
-        pos[:, 1] += (v_flee * dt_s * uy + rng.normal(0, 0.3 * dt_s, n)) / mlat
-        heading = np.arctan2(uy, ux)
         _clamp_reflect(pos, heading, bbox)
         return pos, heading, meta
 

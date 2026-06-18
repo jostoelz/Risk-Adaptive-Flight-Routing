@@ -9,10 +9,9 @@ Ground Control Station for a physical drone (Raspberry Pi client).
 
 Mandatory endpoints (architecture spec):
 
-    POST /update_herd     Accept live drone GPS + detected livestock (and any
-                          detected threats) from the Raspberry Pi. Stores the
-                          packet and immediately returns the freshly planned
-                          next 3-5 receding-horizon waypoints.
+    POST /update_herd     Accept live drone GPS + detected livestock from the
+                          Raspberry Pi. Stores the packet and immediately returns
+                          the freshly planned next 3-5 receding-horizon waypoints.
 
     GET  /next_waypoints  Return ONLY the next 3-5 RHC-optimised 3D waypoints
                           [Lat, Lon, Alt, Speed] for the flight controller,
@@ -103,10 +102,6 @@ class HerdUpdate(BaseModel):
         default_factory=list,
         description="Detected livestock as [[lat, lon], ...].",
     )
-    threats: List[List[float]] = Field(
-        default_factory=list,
-        description="Detected threats (wolves) as [[lat, lon], ...].",
-    )
     n_waypoints: int = Field(4, ge=3, le=5, description="RHC horizon length (3-5).")
 
 
@@ -123,7 +118,6 @@ class WaypointsResponse(BaseModel):
     count: int
     seq: int
     computed_at: float
-    threat_active: bool
     message: str = "ok"
 
 
@@ -143,17 +137,12 @@ def _compute_waypoints_from_telemetry(tele: dict) -> List[dict]:
     ll = (np.array([[lon, lat] for lat, lon in livestock], dtype=float)
           if livestock else None)
 
-    threats = tele.get("threats") or []
-    tt = (np.array([[lon, lat] for lat, lon in threats], dtype=float)
-          if threats else None)
-
     drone_lonlat = (float(tele["drone_lon"]), float(tele["drone_lat"]))
     n = int(tele.get("n_waypoints", 4))
 
     result = model.update(
         livestock_lonlat=ll,
         drone_lonlat=drone_lonlat,
-        threats_lonlat=tt,
         n_waypoints=n,
     )
     return result.waypoints
@@ -190,7 +179,6 @@ def update_herd(packet: HerdUpdate):
         drone_lat=packet.drone_lat,
         drone_lon=packet.drone_lon,
         livestock=packet.livestock,
-        threats=packet.threats,
         drone_alt=packet.drone_alt,
         n_waypoints=packet.n_waypoints,
     )
@@ -202,7 +190,6 @@ def update_herd(packet: HerdUpdate):
         count=len(waypoints),
         seq=int(state["seq"]),
         computed_at=time.time(),
-        threat_active=bool(packet.threats),
         message="telemetry ingested; horizon recomputed",
     )
 
@@ -219,7 +206,7 @@ def next_waypoints(n: Optional[int] = None):
     if not tele:
         return WaypointsResponse(
             waypoints=[], count=0, seq=int(state.get("seq", 0)),
-            computed_at=time.time(), threat_active=False,
+            computed_at=time.time(),
             message="no telemetry received yet — POST /update_herd first",
         )
 
@@ -234,7 +221,6 @@ def next_waypoints(n: Optional[int] = None):
         count=len(waypoints),
         seq=int(state.get("seq", 0)),
         computed_at=time.time(),
-        threat_active=bool(tele.get("threats")),
         message="ok",
     )
 

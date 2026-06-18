@@ -11,14 +11,13 @@ Interactive Streamlit dashboard wrapping the Phase 1 mathematical core
     * the pasture polygon overlay,
     * the dynamic 2D Gaussian risk heatmap as semi-transparent coloured blocks,
     * the livestock as moving dots (synthetic herd motion in SIMULATION MODE),
-    * the live-updating 3D drone trajectory string + planned next waypoints,
-    * any active virtual-wolf threats.
+    * the live-updating 3D drone trajectory string + planned next waypoints.
 
 The sidebar exposes every hardware parameter as a live slider; changing any of
 them instantly re-derives the per-cell flight envelope (max safe altitude &
-velocity). The main panel hosts the prominent 'Trigger Virtual Wolf Spawn'
-button which injects a threat near natural cover and forces the risk matrix in
-model.py to recalibrate on the next cycle.
+velocity). A scenario selector drives the herd behaviour, and the planner adapts
+automatically between a tight Bodyguard orbit and a wide Area-Coverage sweep
+depending on how dispersed the herd is.
 
 Run with:   streamlit run app.py
 ==============================================================================
@@ -357,26 +356,21 @@ def _bbox_from_model(model: RiskModel):
 
 
 def _reset_simulation() -> None:
-    """Reset the herd, drone, trail, threats and lock for the active scenario."""
+    """Reset the herd, drone, trail and cluster lock for the active scenario."""
     model = st.session_state.get("model")
     st.session_state.rng = np.random.default_rng(7)
     st.session_state.tick = 0
-    st.session_state.threats = []
     st.session_state.drone_trail = []
     st.session_state._live_seq = None
     scenario = st.session_state.get("scenario", scenarios.SCENARIOS[0])
     if model is not None:
         bbox = _bbox_from_model(model)
         n = int(st.session_state.get("n_animals", 24))
-        # The Panic scenario spawns a wolf on a real forest-edge cell.
-        wolf = (model.sample_threat_location(0)
-                if scenario == "Sudden Wolf Threat / Panic" else None)
         herd, heading, meta = scenarios.init_scenario(
-            scenario, n, bbox, st.session_state.rng, wolf_lonlat=wolf)
+            scenario, n, bbox, st.session_state.rng)
         st.session_state.herd = herd
         st.session_state.heading = heading
         st.session_state.scenario_meta = meta
-        st.session_state.threats = [meta["wolf"]] if meta.get("wolf") else []
         st.session_state.drone = (
             0.5 * (bbox[0] + bbox[2]),
             bbox[1] + 0.10 * (bbox[3] - bbox[1]),
@@ -532,30 +526,10 @@ st.caption("Informative Path Planning over a live Gaussian risk field — "
            "ETH AI Sprint demo. Static planning is forbidden: the engine emits "
            "only the next 3–5 receding-horizon waypoints each cycle.")
 
-act1, act2, act3 = st.columns([2, 1, 1])
-with act1:
-    wolf_clicked = st.button(
-        "🚨  TRIGGER VIRTUAL WOLF SPAWN  🐺",
-        type="primary",
-        width="stretch",
-        disabled=not is_sim,
-        help="Injects a threat coordinate near the forest edge and forces the "
-             "risk matrix to recalibrate dynamically (Simulation mode).",
-    )
-with act2:
-    clear_threats = st.button("🧹 Clear threats", width="stretch",
-                              disabled=not is_sim)
-with act3:
-    advance_once = st.button(
-        "🔁 Advance frame" if is_sim else "🔄 Refresh feed", width="stretch")
-
-# --- process action buttons (mutate state before recomputation) ---
-if clear_threats:
-    st.session_state.threats = []
-if wolf_clicked:
-    loc = model.sample_threat_location(index=len(st.session_state.threats))
-    st.session_state.threats.append(loc)
-    st.toast(f"🐺 Wolf spawned at {loc[1]:.5f}, {loc[0]:.5f} — recalibrating risk!")
+advance_once = st.button(
+    "🔁 Advance frame" if is_sim else "🔄 Refresh feed", type="primary",
+    width="stretch",
+    help="Advance the simulation one cycle (or refresh the live telemetry feed).")
 
 
 # ==============================================================================
@@ -575,14 +549,11 @@ if is_sim:
         )
 
     herd = st.session_state.herd
-    threats = list(st.session_state.threats)
     drone = st.session_state.drone
 
-    threats_arr = np.array(threats, dtype=float) if threats else None
     result = model.update(
         livestock_lonlat=herd,
         drone_lonlat=drone,
-        threats_lonlat=threats_arr,
         n_waypoints=n_waypoints,
     )
 
@@ -618,8 +589,6 @@ else:
         ls = tele.get("livestock") or []
         herd = (np.array([[lon, lat] for lat, lon in ls], dtype=float)
                 if ls else np.empty((0, 2)))
-        th = tele.get("threats") or []
-        threats = [[lon, lat] for lat, lon in th]  # (lon, lat) for the map
         drone = (float(tele["drone_lon"]), float(tele["drone_lat"]))
 
         # Append to the flown trajectory only when a NEW packet arrived.
@@ -633,14 +602,11 @@ else:
     else:
         # No telemetry yet: keep the map centred with an empty herd.
         herd = np.empty((0, 2))
-        threats = []
         drone = st.session_state.drone
 
-    threats_arr = np.array(threats, dtype=float) if threats else None
     result = model.update(
         livestock_lonlat=(herd if len(herd) else None),
         drone_lonlat=drone,
-        threats_lonlat=threats_arr,
         n_waypoints=n_waypoints,
     )
 
@@ -648,16 +614,13 @@ else:
     if new_packet and tele:
         seq = live.get("seq")
         n_ls = len(tele.get("livestock") or [])
-        peak = float(result.risk[result.grid.mask].max()) if result.grid.mask.any() else 0.0
         term_log("CONNECTED",
                  f"RPi telemetry received — drone @ {drone[1]:.5f}, {drone[0]:.5f} "
                  f"· {n_ls} livestock tracked (seq {seq})")
-        if threats:
-            term_log("ALERT",
-                     f"Wolf signature detected near forest edge — risk matrix "
-                     f"recalibrated (peak risk {peak:.2f})")
+        mode_label = ("AREA-COVERAGE sweep" if result.is_scattered else
+                      "SPLIT-lock orbit" if result.is_split else "Bodyguard orbit")
         term_log("COMPUTING",
-                 "3D waypoints generated via RHC (MDP value-iteration + 2-opt MTSP)")
+                 f"3D waypoints generated via RHC ({mode_label})")
         k = len(result.waypoints)
         term_log("SENT",
                  f"{k} waypoints pushed to flight controller [Lat, Lon, Alt, Speed]")
@@ -679,14 +642,19 @@ trail = st.session_state.drone_trail
 # STATUS METRICS
 # ==============================================================================
 
-valid_risk = result.risk[result.grid.mask]
+if result.is_scattered:
+    patrol_mode = "🔭 Area Coverage"
+elif result.is_split:
+    patrol_mode = "🎯 Split-lock Orbit"
+else:
+    patrol_mode = "🛡️ Bodyguard Orbit"
+n_livestock = int(len(herd)) if herd is not None else 0
+
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Threat level", f"{valid_risk.max():.2f}",
-          delta="WOLF ACTIVE" if threats else None,
-          delta_color="inverse" if threats else "off")
+m1.metric("Patrol mode", patrol_mode)
 m2.metric("Max detection alt.", f"{result.h_max_m:.1f} m")
 m3.metric("Min safe alt.", f"{result.h_min_m:.1f} m")
-m4.metric("Active threats", f"{len(threats)}")
+m4.metric("Livestock tracked", f"{n_livestock}")
 m5.metric("Cycle / tick", f"{st.session_state.tick}")
 
 if not is_sim:
@@ -716,13 +684,11 @@ if not is_sim:
                     bbox[1] + 0.45 * (bbox[3] - bbox[1]) + 0.0001 * (i % 3),
                     bbox[0] + 0.40 * (bbox[2] - bbox[0]) + 0.0001 * (i // 3),
                 ] for i in range(8)]
-                wolf = model.sample_threat_location(index=0)  # (lon, lat)
                 packet = {
                     "drone_lat": bbox[1] + 0.10 * (bbox[3] - bbox[1]),
                     "drone_lon": 0.5 * (bbox[0] + bbox[2]),
                     "drone_alt": 25.0,
                     "livestock": test_ls,
-                    "threats": [[wolf[1], wolf[0]]],  # wire order [lat, lon]
                     "n_waypoints": n_waypoints,
                 }
                 resp = http_post_json(f"{api_base.rstrip('/')}/update_herd", packet)
@@ -926,22 +892,6 @@ layers.append(pdk.Layer(
     radius_max_pixels=12,
 ))
 
-# 7) Active threats (wolves)
-if threats:
-    threat_df = pd.DataFrame(threats, columns=["lon", "lat"])
-    layers.append(pdk.Layer(
-        "ScatterplotLayer",
-        data=threat_df,
-        get_position=["lon", "lat"],
-        get_fill_color=[220, 0, 0, 230],
-        get_line_color=[255, 255, 255, 255],
-        line_width_min_pixels=2,
-        stroked=True,
-        get_radius=10,
-        radius_min_pixels=8,
-        radius_max_pixels=18,
-    ))
-
 view_state = pdk.ViewState(
     longitude=0.5 * (bbox[0] + bbox[2]),
     latitude=0.5 * (bbox[1] + bbox[3]),
@@ -1021,7 +971,6 @@ with right:
         (_dot("rgb(255,255,255)", "#222"), "Livestock — guarded group"),
         (_dot("rgba(140,140,150,0.45)", "#666"), "Livestock — deprioritised (dimmed)"),
         (_dot("rgb(0,120,255)"), "Drone position"),
-        (_dot("rgb(220,0,0)"), "Active wolf threat"),
         (_dot("rgb(20,80,30)", "#dfffdf"), "OSM forest edge"),
         (_line("rgb(255,215,0)"), "Flown path (B-spline)"),
         (_line("rgb(0,200,255)"), "Planned path (B-spline)"),
@@ -1055,19 +1004,17 @@ with right:
 with st.expander("ℹ️ How the pipeline reacts to your controls"):
     st.markdown(
         """
-        * **Bodyguard Mode** — risk is centred on the **herd** (`livestock_gain ·
-          H · (1 + forest_boost · F)`). The peak sits directly over the animals,
-          so the spline path flies tight, continuous curves over / circling the
-          herd as it moves; the forest only gently amplifies the threatened flank.
+        * **Adaptive patrol mode** — the planner switches automatically by herd
+          dispersion: a **compact** cluster → tight **Bodyguard orbit**; a clean
+          **2-group split** → **hysteresis-locked orbit** on the nearest group; a
+          **scattered** herd (spread > 60 m) → a wide KDE cloud and a sweeping
+          **Area-Coverage** patrol over the whole field (no single-animal locking).
         * **Hardware sliders** re-derive the per-cell *flight envelope* instantly:
           lower `min wolf px` / higher altitude ⇒ faster flight; a larger
           *weather/visibility buffer* forces more image overlap ⇒ the drone flies
           **lower and slower** to avoid blind spots.
         * **Livestock risk gain** controls how strongly the herd-coupled term
           dominates the static creek/hedge structure.
-        * **Trigger Virtual Wolf Spawn** adds a sharply-peaked threat near natural
-          cover; the risk matrix renormalises so the planner is pulled toward the
-          threat on the very next cycle.
         """
     )
 

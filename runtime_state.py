@@ -18,7 +18,6 @@ State schema:
       "telemetry": {                 # last packet from the drone, or None
           "drone_lat": float, "drone_lon": float, "drone_alt": float|None,
           "livestock": [[lat, lon], ...],
-          "threats":   [[lat, lon], ...],
           "n_waypoints": int,
           "received_at": float       # unix seconds
       },
@@ -74,7 +73,6 @@ def update_telemetry(
     drone_lat: float,
     drone_lon: float,
     livestock: List[List[float]],
-    threats: Optional[List[List[float]]] = None,
     drone_alt: Optional[float] = None,
     n_waypoints: int = 4,
 ) -> Dict:
@@ -85,7 +83,6 @@ def update_telemetry(
         "drone_lon": float(drone_lon),
         "drone_alt": (float(drone_alt) if drone_alt is not None else None),
         "livestock": [[float(a), float(b)] for a, b in (livestock or [])],
-        "threats": [[float(a), float(b)] for a, b in (threats or [])],
         "n_waypoints": int(n_waypoints),
         "received_at": time.time(),
     }

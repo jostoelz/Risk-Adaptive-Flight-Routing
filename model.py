@@ -713,21 +713,30 @@ def compute_forest_proximity(
 # 5. HERD PROXIMITY FIELD VIA KDE  (Rule 2)  — the dynamic half of V2.0 risk
 # ==============================================================================
 
+# Bandwidth multiplier applied to Silverman's rule in the SCATTERED state, to
+# melt scattered individual animals into one continuous area-coverage cloud.
+SCATTERED_BW_FACTOR = 2.5
+
+
 def compute_herd_proximity(
     grid: Grid,
     livestock_lonlat: Optional[np.ndarray],
     guard_radius_m: float = 70.0,
+    scattered: bool = False,
 ) -> np.ndarray:
     """
     Smooth herd-proximity field H in [0, 1] (scipy.stats.gaussian_kde).
 
-    H is ~1 at the herd and decays smoothly over a protective 'guard radius' —
-    the zone the drone must keep watch over. The KDE bandwidth is widened to
-    roughly `guard_radius_m` so forest edges a short distance from the animals
-    still fall inside the field; a fixed Gaussian-bump fallback covers tiny or
-    degenerate herds. It is recomputed from live coordinates every cycle, so the
-    field — and therefore the coupled forest hotspots — travel with the herd.
-    Shaped (ny, nx).
+    Two regimes:
+      * Normal (compact / locked cluster): the KDE bandwidth is widened to roughly
+        `guard_radius_m`, giving a tight protective zone around the herd centroid.
+      * SCATTERED (scattered=True): the bandwidth is Silverman's rule × 2.5
+        (`SCATTERED_BW_FACTOR`), melting the individual animal dots into one large
+        continuous risk cloud spanning the whole active pasture — so the planner
+        sweeps the area rather than locking onto a single isolated animal.
+
+    A fixed Gaussian-bump fallback covers tiny/degenerate herds. Recomputed from
+    live coordinates each cycle. Shaped (ny, nx).
     """
     ny, nx = grid.shape
     if livestock_lonlat is None or len(livestock_lonlat) == 0:
@@ -740,17 +749,23 @@ def compute_herd_proximity(
     field = None
     if sample.shape[1] >= 3 and not np.allclose(sample.std(axis=1), 0.0):
         try:
-            # Widen the kernel so its std ≈ guard radius (bw factor ≈ guard/spread).
-            spread = max(float(np.hypot(sample[0].std(), sample[1].std())), 1.0)
-            bw = float(np.clip(guard_radius_m / spread, 0.15, 25.0))
-            kde = gaussian_kde(sample, bw_method=bw)
+            if scattered:
+                # Silverman's rule, then significantly widened.
+                kde = gaussian_kde(sample, bw_method="silverman")
+                kde.set_bandwidth(bw_method=kde.factor * SCATTERED_BW_FACTOR)
+            else:
+                # Widen the kernel so its std ≈ guard radius (factor ≈ guard/spread).
+                spread = max(float(np.hypot(sample[0].std(), sample[1].std())), 1.0)
+                bw = float(np.clip(guard_radius_m / spread, 0.15, 25.0))
+                kde = gaussian_kde(sample, bw_method=bw)
             GX, GY = grid.mesh_xy()
             field = kde(np.vstack([GX.ravel(), GY.ravel()])).reshape(ny, nx)
         except Exception:
             field = None
 
     if field is None:
-        field = _fixed_bump_density(grid, lx, ly, sigma_m=guard_radius_m)
+        sigma = guard_radius_m * (SCATTERED_BW_FACTOR if scattered else 1.0)
+        field = _fixed_bump_density(grid, lx, ly, sigma_m=sigma)
 
     fmax = field.max()
     if fmax > 0:
@@ -772,6 +787,16 @@ def _fixed_bump_density(grid: Grid, lx: np.ndarray, ly: np.ndarray,
     return dens
 
 
+# Herd dispersion above which the state is declared SCATTERED (metres, RMS
+# radius from the centroid) when there is no clean two-cluster split.
+SCATTER_SPREAD_M = 60.0
+
+# Herd state constants.
+STATE_COMPACT = "compact"
+STATE_SPLIT = "split"
+STATE_SCATTERED = "scattered"
+
+
 def select_focus_cluster(
     livestock_lonlat: Optional[np.ndarray],
     drone_lonlat: Optional[Tuple[float, float]],
@@ -779,42 +804,34 @@ def select_focus_cluster(
     hysteresis_m: float = 50.0,
     min_separation_m: float = 45.0,
     gap_factor: float = 2.2,
-) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], bool,
+    scatter_spread_m: float = SCATTER_SPREAD_M,
+) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]], str,
            Optional[np.ndarray], Optional[Tuple[float, float]]]:
     """
-    Pick the herd sub-group the drone should guard, with hysteresis.
+    Classify the herd and pick what the drone should track. Three states:
 
-    When the herd splits into two groups a single KDE develops a zero-gradient
-    SADDLE between them, making the planner jitter in the middle. To avoid this
-    we detect a bimodal split (largest gap along the herd's principal axis) and,
-    if real, lock the planner onto ONE group:
+      * SPLIT     -- two clean SVD clusters (largest principal-axis gap is clearly
+                     bimodal AND the groups are far apart). The planner locks onto
+                     ONE group with hysteresis (no mid-saddle jitter); the chosen
+                     group's centroid is returned for the lock.
+      * SCATTERED -- no clean split AND the omnidirectional RMS spread exceeds
+                     `scatter_spread_m`. Single-animal locking is disabled; the
+                     whole herd is returned so a wide KDE covers the area and the
+                     drone runs an area-coverage sweep instead of orbiting a dot.
+      * COMPACT   -- a single tight cluster -> orbit its centroid.
 
-      * No prior lock  -> choose the group whose centroid is nearest the drone.
-      * Prior lock      -> stay on the group continuous with the locked centroid,
-                           and switch to the other group ONLY when it becomes
-                           `hysteresis_m` closer to the drone. This hysteresis
-                           kills the flip-flop at the midpoint.
-
-    Returns (subset_lonlat, chosen_centroid, is_split, guarded_mask, other_centroid):
-      * guarded_mask  -- bool array over the INPUT livestock order: True for the
-                         guarded sub-group (all True when not split). The frontend
-                         uses it to dim the deprioritised animals.
-      * other_centroid-- (lon, lat) of the deprioritised cluster (None when not
-                         split). The frontend uses it to make the heatmap fully
-                         transparent over the deprioritised side.
-    When not split it returns (all points, None, False, all-True mask, None) — the
-    caller clears the lock so a fresh split re-selects by drone proximity. A wolf
-    near the other group is handled separately by the threat field, which can
-    still pull the drone across.
+    Returns (subset_lonlat, chosen_centroid, state, guarded_mask, other_centroid):
+      * guarded_mask  -- bool over the INPUT order: True for the guarded subgroup
+                         (all True unless SPLIT). Frontend dims the rest.
+      * other_centroid-- (lon, lat) of the deprioritised cluster (SPLIT only).
+    chosen_centroid is None outside the SPLIT state (the caller clears its lock).
     """
     if livestock_lonlat is None:
-        return None, None, False, None, None
+        return None, None, STATE_COMPACT, None, None
     pts = np.asarray(livestock_lonlat, dtype=float).reshape(-1, 2)
     n = pts.shape[0]
     if n == 0:
-        return pts, None, False, np.zeros(0, dtype=bool), None
-    if n < 4 or drone_lonlat is None:
-        return pts, None, False, np.ones(n, dtype=bool), None
+        return pts, None, STATE_COMPACT, np.zeros(0, dtype=bool), None
 
     # Local metric scale (lon/lat -> metres) at the herd's latitude.
     ref_lat = float(np.mean(pts[:, 1]))
@@ -824,18 +841,28 @@ def select_focus_cluster(
     def _m(a, b):  # distance in metres between two (lon, lat) points
         return math.hypot((a[0] - b[0]) * mlon, (a[1] - b[1]) * mlat)
 
-    # Split along the principal axis at the largest gap.
+    # Omnidirectional RMS spread (metres) about the centroid.
     c = pts.mean(axis=0)
     X = np.column_stack([(pts[:, 0] - c[0]) * mlon, (pts[:, 1] - c[1]) * mlat])
+    spread_m = float(np.sqrt(np.mean(np.sum(X ** 2, axis=1)))) if n else 0.0
+
+    def _scattered_or_compact():
+        state = STATE_SCATTERED if spread_m > scatter_spread_m else STATE_COMPACT
+        return pts, None, state, np.ones(n, dtype=bool), None
+
+    if n < 4 or drone_lonlat is None:
+        return _scattered_or_compact()
+
+    # Try a clean two-cluster split along the principal axis (largest gap).
     try:
         _, _, vt = np.linalg.svd(X, full_matrices=False)
     except Exception:
-        return pts, None, False, np.ones(n, dtype=bool), None
+        return _scattered_or_compact()
     proj = X @ vt[0]
     order = np.argsort(proj)
     gaps = np.diff(proj[order])
     if gaps.size == 0:
-        return pts, None, False, np.ones(n, dtype=bool), None
+        return _scattered_or_compact()
     gi = int(np.argmax(gaps))
     max_gap = float(gaps[gi])
     med_gap = float(np.median(gaps))
@@ -843,15 +870,14 @@ def select_focus_cluster(
 
     idx_a, idx_b = order[:gi + 1], order[gi + 1:]
     if idx_a.size < 2 or idx_b.size < 2:
-        return pts, None, False, np.ones(n, dtype=bool), None
+        return _scattered_or_compact()
 
     ca = tuple(pts[idx_a].mean(axis=0))
     cb = tuple(pts[idx_b].mean(axis=0))
     sep_m = _m(ca, cb)
-    # Only treat as a genuine split if the gap is clearly bimodal AND the groups
-    # are physically far apart; otherwise it is one blob -> use everything.
     if not (max_gap > gap_factor * med_gap and sep_m > min_separation_m):
-        return pts, None, False, np.ones(n, dtype=bool), None
+        # Not two clean clusters -> scattered (if wide) or compact.
+        return _scattered_or_compact()
 
     da, db = _m(ca, drone_lonlat), _m(cb, drone_lonlat)
 
@@ -877,44 +903,9 @@ def select_focus_cluster(
     guarded_mask[chosen_idx] = True
     return (pts[chosen_idx],
             (float(chosen_c[0]), float(chosen_c[1])),
-            True,
+            STATE_SPLIT,
             guarded_mask,
             (float(other_c[0]), float(other_c[1])))
-
-
-# ==============================================================================
-# 5b. ACTIVE THREAT FIELD  (Virtual Wolf Spawn)
-# ==============================================================================
-
-def compute_threat_field(
-    grid: Grid,
-    threats_lonlat: Optional[np.ndarray],
-    sigma_cells: float = 1.6,
-) -> np.ndarray:
-    """
-    Localised, sharply-peaked Gaussian field around each active threat (wolf).
-
-    A detected/spawned wolf is a hard, near-certain danger, so its kernel is much
-    tighter than the herd KDE. Returns a field in [0, 1], shaped (ny, nx). When
-    fed into combine_risk() it dominates the matrix locally and forces the whole
-    risk map -- and therefore the path planner -- to recalibrate.
-    """
-    ny, nx = grid.shape
-    if threats_lonlat is None or len(threats_lonlat) == 0:
-        return np.zeros((ny, nx), dtype=float)
-
-    threats_lonlat = np.asarray(threats_lonlat, dtype=float).reshape(-1, 2)
-    tx, ty = grid.lonlat_to_xy(threats_lonlat[:, 0], threats_lonlat[:, 1])
-
-    GX, GY = grid.mesh_xy()
-    sigma = max(sigma_cells * grid.cell_size_m, 1e-6)
-    field = np.zeros(GX.shape, dtype=float)
-    for x0, y0 in zip(np.atleast_1d(tx), np.atleast_1d(ty)):
-        field += np.exp(-((GX - x0) ** 2 + (GY - y0) ** 2) / (2.0 * sigma ** 2))
-    fmax = field.max()
-    if fmax > 0:
-        field /= fmax
-    return field
 
 
 # ==============================================================================
@@ -927,8 +918,6 @@ def combine_risk(
     baseline_gpr: np.ndarray,
     mask: np.ndarray,
     livestock_gain: float = 2.5,
-    threat_field: Optional[np.ndarray] = None,
-    threat_weight: float = 25.0,
     forest_boost: float = 0.30,
     w_static: float = 0.08,
 ) -> np.ndarray:
@@ -937,23 +926,20 @@ def combine_risk(
 
         herd_core = herd_proximity * (1 + forest_boost * forest_proximity)
         risk_raw  = livestock_gain * herd_core + w_static * baseline_gpr
-                    (+ threat_weight * wolf_threat,  when a wolf is active)
         risk      = (risk_raw - min) / (max - min)          # strictly -> [0, 1]
 
     Design (Bodyguard):
-      * The HERD field H is the dominant driver, so the absolute peak risk sits
-        directly ON the herd — the drone is commanded to fly over / tightly circle
-        the animals rather than loiter at the forest border.
+      * The HERD field H is the dominant driver, so the peak risk sits ON the herd
+        (a tight cluster -> a single hotspot; a scattered herd -> a broad cloud,
+        because H is built from a deliberately wide KDE in the SCATTERED state).
       * The forest field acts only as a MINOR MULTIPLIER (1 + forest_boost * F),
-        gently emphasising the flank of the herd that faces the tree line; it can
-        never out-score the herd itself.
-      * There is no forest-only additive term: away from the herd the forest edge
-        carries essentially no patrol value (only the faint w_static structure).
-    Because H is recomputed from live coordinates each cycle, the deep-crimson
-    hotspot moves with the herd and the RHC planner re-routes to stay on top of it.
+        gently emphasising the flank facing the tree line; it can never out-score
+        the herd itself.
+      * The faint w_static term preserves creek/hedge structure.
+    Because H is recomputed from live coordinates each cycle, the hotspot/cloud
+    moves with the herd and the RHC planner re-routes to follow it.
 
-    The matrix is strictly min-max normalised to [0, 1]; an active wolf threat is
-    added with a large weight so it dominates locally.
+    The matrix is strictly min-max normalised to [0, 1] to prevent overflow.
     """
     F = np.clip(np.nan_to_num(forest_proximity, nan=0.0), 0.0, 1.0)
     H = np.clip(np.nan_to_num(herd_proximity, nan=0.0), 0.0, 1.0)
@@ -963,10 +949,6 @@ def combine_risk(
 
     herd_core = H * (1.0 + fb * F)          # herd-centred; forest only amplifies
     risk_raw = g * herd_core + float(max(w_static, 0.0)) * B
-
-    if threat_field is not None:
-        tf = np.clip(np.nan_to_num(threat_field, nan=0.0), 0.0, 1.0)
-        risk_raw = risk_raw + float(max(threat_weight, 0.0)) * tf
 
     # Restrict normalisation statistics to valid (in-polygon) cells.
     valid = risk_raw[mask] if mask.any() else risk_raw.ravel()
@@ -1365,8 +1347,10 @@ class RiskModelResult:
     forest_proximity: np.ndarray          # [0,1]; 1.0 within 20 m of forest edge
     forest_distance_m: np.ndarray         # metres to nearest forest edge (inf if none)
     forest_points_lonlat: np.ndarray      # the OSM forest-edge sample points
-    # Split-herd focus context (frontend rendering only; physics unaffected).
+    # Adaptive tracking-state context (frontend rendering only; physics unaffected).
+    state: str = "compact"                # "compact" | "split" | "scattered"
     is_split: bool = False                # herd split into two guarded/other groups
+    is_scattered: bool = False            # wide dispersion -> area-coverage sweep
     herd_guarded_mask: Optional[np.ndarray] = None   # bool over input herd order
     guarded_centroid: Optional[Tuple[float, float]] = None     # (lon, lat)
     other_centroid: Optional[Tuple[float, float]] = None       # (lon, lat) deprioritised
@@ -1409,51 +1393,47 @@ class RiskModel:
         self,
         livestock_lonlat: Optional[np.ndarray],
         drone_lonlat: Tuple[float, float],
-        threats_lonlat: Optional[np.ndarray] = None,
         n_waypoints: int = 4,
     ) -> RiskModelResult:
         """One receding-horizon cycle: recompute live risk and next waypoints.
 
-        `threats_lonlat` carries any active virtual-wolf spawns; passing them in
-        forces the risk matrix (and hence the planner) to recalibrate.
+        Adaptive behaviour switch:
+          * COMPACT / SPLIT -> Orbit Mode: a tight KDE around the (locked) cluster
+            centroid; the planner flies a geometric bodyguard ring around it.
+          * SCATTERED       -> Area-Coverage Mode: a deliberately wide KDE melts the
+            animals into one cloud and the MDP policy rollout sweeps the whole area.
         """
-        # Split-herd focus: lock onto the nearest sub-group (with hysteresis) so a
-        # bimodal KDE saddle never makes the drone jitter between two groups.
-        (focus_subset, focus_centroid, is_split,
+        (focus_subset, focus_centroid, state,
          guarded_mask, other_centroid) = select_focus_cluster(
             livestock_lonlat, drone_lonlat, self._locked_cluster_centroid)
         self._locked_cluster_centroid = focus_centroid
-        herd_proximity = compute_herd_proximity(self.grid, focus_subset)
-        threat_field = compute_threat_field(self.grid, threats_lonlat)
+        is_split = state == STATE_SPLIT
+        is_scattered = state == STATE_SCATTERED
+
+        herd_proximity = compute_herd_proximity(
+            self.grid, focus_subset, scattered=is_scattered)
         # V2.0: couple the static forest-edge field to the live herd proximity.
         risk = combine_risk(
             self.forest_proximity, herd_proximity, self.baseline_gpr,
-            self.grid.mask, self.livestock_gain, threat_field=threat_field,
+            self.grid.mask, self.livestock_gain,
         )
         env = compute_flight_envelope(risk, self.hw)
 
-        # Orbit-Guard (Philosophy A Pro): when a herd cluster is active, fly a
-        # smooth geometric ring around its dynamic centroid instead of letting
-        # the MDP rollout chatter on individual animals.
+        # Adaptive planner: Orbit Mode rings a compact/locked cluster; Area-Coverage
+        # Mode lets the MDP policy rollout sweep the broad scattered field.
         orbit_center = None
-        if focus_subset is not None and len(focus_subset) > 0:
+        if not is_scattered and focus_subset is not None and len(focus_subset) > 0:
             cen = np.asarray(focus_subset, dtype=float).reshape(-1, 2).mean(axis=0)
             orbit_center = (float(cen[0]), float(cen[1]))
 
-        # Threat override: an active wolf dominates the risk field, so the drone
-        # BREAKS its orbit / lock and intercepts the danger zone via the MDP
-        # policy rollout (which climbs to the wolf's risk peak). With no threat it
-        # orbits the herd; with no herd it patrols via the rollout.
-        threats_active = (threats_lonlat is not None and
-                          np.asarray(threats_lonlat).reshape(-1, 2).shape[0] > 0)
-        if threats_active or orbit_center is None:
-            waypoints = plan_receding_horizon(
-                risk, env, self.grid, drone_lonlat, n_waypoints=n_waypoints,
-            )
-        else:
+        if orbit_center is not None:
             waypoints = plan_orbit(
                 orbit_center, drone_lonlat, self.grid, risk, env,
                 n_waypoints=n_waypoints, radius_m=self.orbit_radius_m,
+            )
+        else:
+            waypoints = plan_receding_horizon(
+                risk, env, self.grid, drone_lonlat, n_waypoints=n_waypoints,
             )
         return RiskModelResult(
             grid=self.grid,
@@ -1469,38 +1449,13 @@ class RiskModel:
             forest_proximity=self.forest_proximity,
             forest_distance_m=self.forest_distance_m,
             forest_points_lonlat=self.features.forest_points_lonlat,
+            state=state,
             is_split=is_split,
+            is_scattered=is_scattered,
             herd_guarded_mask=guarded_mask,
             guarded_centroid=focus_centroid,
             other_centroid=other_centroid,
         )
-
-    def sample_threat_location(self, index: int = 0) -> Tuple[float, float]:
-        """Pick a plausible wolf-spawn coordinate near natural cover.
-
-        Wolves approach from forest edges / hedges / creeks, exactly where the
-        GPR baseline risk peaks. We select among the highest-baseline in-polygon
-        cells (deterministic in `index`) and jitter inside the cell.
-        """
-        base = np.where(self.grid.mask, self.baseline, -np.inf)
-        ny, nx = self.grid.shape
-        order = np.argsort(base.ravel())[::-1]
-        n_valid = int(self.grid.mask.sum())
-        pool = max(5, int(0.15 * n_valid))
-        top = order[:min(pool, n_valid)]
-        if top.size == 0:
-            return (float(self.grid.lons.mean()), float(self.grid.lats.mean()))
-        flat = int(top[index % top.size])
-        ry, rx = divmod(flat, nx)
-
-        # Deterministic sub-cell jitter so repeated spawns are not identical.
-        dlon = (self.grid.lons[1] - self.grid.lons[0]) if nx > 1 else 0.0
-        dlat = (self.grid.lats[1] - self.grid.lats[0]) if ny > 1 else 0.0
-        jx = (((index * 37) % 7) / 7.0 - 0.5) * 0.6
-        jy = (((index * 53) % 5) / 5.0 - 0.5) * 0.6
-        lon = float(self.grid.lons[rx] + jx * dlon)
-        lat = float(self.grid.lats[ry] + jy * dlat)
-        return (lon, lat)
 
 
 # ==============================================================================
@@ -1558,6 +1513,7 @@ def _demo() -> None:
     print(f"  min={valid.min():.3f}  max={valid.max():.3f}  mean={valid.mean():.3f}")
     assert valid.min() >= 0.0 and valid.max() <= 1.0, "risk not normalised to [0,1]!"
     print("  -> strictly normalised in [0, 1]  OK")
+    print(f"  tracking state = {result.state}")
 
     print("\n[NEXT WAYPOINTS] (receding horizon)")
     for i, wp in enumerate(result.waypoints, 1):

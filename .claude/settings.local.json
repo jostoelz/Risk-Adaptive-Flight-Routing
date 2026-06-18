@@ -36,7 +36,8 @@
       "PowerShell(python _split_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
       "PowerShell(python _render_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
       "PowerShell(python _orbit_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
-      "PowerShell(python _scenario_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))"
+      "PowerShell(python _scenario_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))",
+      "PowerShell(python _adaptive_test.py 2>&1 | Select-String -Pattern \"Thread 'MainThread'|to view|streamlit:|command:|RemoteException|run it with|ScriptRunContext|Session state\" -NotMatch; Write-Output \\(\"exit: \" + $LASTEXITCODE\\))"
     ]
   }
 }

@@ -25,7 +25,7 @@ except Exception:
 DEFAULT_BASE = "https://risk-adaptive-flight-routing.streamlit.app"
 BASE = (sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BASE).rstrip("/")
 
-# A realistic packet: drone south of the pasture, a livestock cluster, one wolf.
+# A realistic packet: drone south of the pasture with a detected livestock cluster.
 TELEMETRY = {
     "drone_lat": 46.79910,
     "drone_lon": 9.84980,
@@ -34,7 +34,6 @@ TELEMETRY = {
         [46.79950, 9.84950], [46.79952, 9.84958], [46.79948, 9.84962],
         [46.80000, 9.85050], [46.80005, 9.85060], [46.79970, 9.84990],
     ],
-    "threats": [[46.80105, 9.84985]],   # near the forest edge
     "n_waypoints": 5,
 }
 
